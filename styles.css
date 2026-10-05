@@ -141,3 +141,17 @@ dialog::backdrop{background:rgba(0,0,0,.55)}
 .status-pick button.s-none{background:var(--s-none)} .status-pick button.s-inst{background:var(--s-inst)} .status-pick button.s-start{background:var(--s-start)}
 .status-pick button.s-cx{background:var(--s-cx)} .status-pick button.s-issue{background:var(--s-issue)}
 input.tag-input::placeholder{text-transform:none;font-weight:500;letter-spacing:0}
+
+/* Age / remaining life */
+.pill.life{font-size:13px}
+.life-ok{--life-c:#2e7d32}.life-warn{--life-c:#d35400}.life-past{--life-c:#c62828}
+.pill.life.life-ok{background:var(--life-c)}.pill.life.life-warn{background:var(--life-c)}.pill.life.life-past{background:var(--life-c)}
+.life-card .life-stats{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:4px}
+@media (min-width:480px){.life-card .life-stats{grid-template-columns:repeat(4,1fr)}}
+.life-n{font-size:22px;font-weight:800;line-height:1.15}
+.life-l{font-size:13px;color:var(--muted);margin-top:2px}
+.life-card .life-ok .life-n,.life-card .life-ok .life-l{color:#2e7d32}
+.life-card .life-warn .life-n,.life-card .life-warn .life-l{color:#d35400}
+.life-card .life-past .life-n,.life-card .life-past .life-l{color:#c62828}
+.life-preview{margin:8px 0 4px}
+.life-preview-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between}

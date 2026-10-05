@@ -1,6 +1,4 @@
-# Asset Tagger (v1.0.0)
-
-**Live app:** https://aperry1320.github.io/asset-tagger/ (open it on your phone, then Add to Home Screen)
+# Asset Tagger (v1.1.0)
 
 Offline-first, mobile-first web app for tagging HVAC / mechanical equipment on job sites
 (AHUs, RTUs, chillers, boilers, pumps, VAVs, FCUs, exhaust fans, cooling towers, heat exchangers, VRF units…).
@@ -10,7 +8,8 @@ Plain static files. No build step, no server code, no account. All data stays in
 ## Features
 - **Projects / job sites** with client, address and notes. Home screen shows progress (commissioned %) and open issues.
 - **Asset records**: tag, equipment type, manufacturer, model, serial, capacity/size, building, floor, room/location,
-  area served, install date, status (Not started / Installed / Started up / Commissioned / Issue), notes, nameplate photos
+  area served, install/mfr year, install date, **age** (auto), **life expectancy** (type defaults), **remaining life** (auto),
+  status (Not started / Installed / Started up / Commissioned / Issue), notes, nameplate photos
   taken with the phone camera (resized to about 1600 px JPEG to save space).
 - **Fast field entry**: equipment type is guessed from the tag prefix (AHU-, RTU-, CH-, B-, P-/CHWP-, VAV-, FCU-, EF-, CT-, HX-, VRF-),
   "Save & next" opens a new asset with the next tag number (VAV-2-01 → VAV-2-02) and the same type, manufacturer, model, building and floor.
@@ -39,8 +38,8 @@ sw.js                  service worker (offline cache)
 manifest.webmanifest   PWA manifest
 icons/                 app icons
 vendor/                html5-qrcode 2.3.8, qrcode-generator 1.4.4, SheetJS xlsx 0.20.3 (bundled locally, so no CDN is needed offline)
-samples/               sample equipment-schedule CSV for trying Import
-.nojekyll              tells GitHub Pages to serve files as-is
+samples/               sample import CSV, sample export xlsx, sample label PDFs, headless end-to-end test script
+screenshots/           mobile screenshots (390×844)
 ```
 
 ## Run locally

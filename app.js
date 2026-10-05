@@ -2,7 +2,7 @@
    Vanilla JS, data in IndexedDB. Vendor libs (loaded on demand): html5-qrcode, SheetJS (xlsx); qrcode-generator loaded up front. */
 'use strict';
 (() => {
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 const TYPES = ['AHU','RTU','Chiller','Boiler','Pump','VAV','FCU','Exhaust Fan','Cooling Tower','Heat Exchanger','VRF Unit','Other'];
 const STATUSES = ['Not started','Installed','Started up','Commissioned','Issue'];
 const STATUS_CLASS = {'Not started':'s-none','Installed':'s-inst','Started up':'s-start','Commissioned':'s-cx','Issue':'s-issue'};
@@ -20,6 +20,11 @@ const TYPE_ALIASES = {
   'vrf':'VRF Unit','vrf unit':'VRF Unit','vrv':'VRF Unit','vrf indoor unit':'VRF Unit','vrf outdoor unit':'VRF Unit',
   'other':'Other'
 };
+const LIFE_DEFAULTS = {
+  'AHU': 25, 'RTU': 15, 'Chiller': 25, 'Boiler': 30, 'Pump': 20, 'VAV': 20,
+  'FCU': 20, 'Exhaust Fan': 20, 'Cooling Tower': 20, 'Heat Exchanger': 25, 'VRF Unit': 15, 'Other': 20
+};
+/* Typical mid-range ASHRAE / industry service lives (years). Prefill only — always overrideable. */
 const FIELDS = [
   {key:'tag', label:'Tag / Asset ID', aliases:['tag','asset id','assetid','asset tag','tag id','equipment tag','equipment id','unit tag','mark','id']},
   {key:'type', label:'Equipment Type', aliases:['type','equipment type','equipment','equip type','asset type','unit type']},
@@ -31,7 +36,10 @@ const FIELDS = [
   {key:'floor', label:'Floor', aliases:['floor','level','flr']},
   {key:'room', label:'Room / Location', aliases:['room / location','room/location','room','location','room #','room number','space']},
   {key:'areaServed', label:'Area Served', aliases:['area served','serves','served area','zone','area']},
+  {key:'installYear', label:'Install Year', aliases:['install year','year installed','manufacture year','year of manufacture','mfg year','year built','built year','install yr','mfr year']},
   {key:'installDate', label:'Install Date', aliases:['install date','installed','installation date','date installed','install']},
+  {key:'lifeExpectancy', label:'Life Expectancy', aliases:['life expectancy','life expectancy (years)','expected life','service life','useful life','design life','life (years)','life years']},
+  {key:'ageOverride', label:'Age Override', aliases:['age override','age (years)','age years','age','equipment age'], export:false},
   {key:'status', label:'Status', aliases:['status','cx status','commissioning status','state']},
   {key:'notes', label:'Notes', aliases:['notes','note','comments','comment','remarks','issues']},
 ];
@@ -60,6 +68,80 @@ const natCmp = (a, b) => String(a ?? '').localeCompare(String(b ?? ''), undefine
 const slug = s => String(s || 'project').trim().replace(/[^a-z0-9]+/gi, '_').replace(/^_|_$/g, '').slice(0, 40) || 'project';
 const statusPill = s => `<span class="pill ${STATUS_CLASS[s] || 's-none'}">${esc(s || 'Not started')}</span>`;
 const locLine = a => [a.building && `Bldg ${a.building}`, a.floor && `Flr ${a.floor}`, a.room].filter(Boolean).join(' · ');
+function parseYear(v) {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number' && isFinite(v)) { const y = Math.round(v); return (y >= 1800 && y <= 2100) ? y : null; }
+  const s = String(v).trim();
+  if (/^(19|20)\d{2}$/.test(s)) return +s;
+  const m = s.match(/(19|20)\d{2}/); return m ? +m[0] : null;
+}
+function defaultLife(type) { return LIFE_DEFAULTS[type] ?? 20; }
+/** Prefer explicit installYear, else year from installDate. */
+function effectiveYear(a) {
+  const y = parseYear(a && a.installYear);
+  if (y != null) return y;
+  return parseYear(a && a.installDate);
+}
+/** Age in whole years. Uses ageOverride if set; else install date anniversary; else install year. */
+function computeAge(a, asOf = new Date()) {
+  if (!a) return null;
+  if (a.ageOverride !== undefined && a.ageOverride !== null && String(a.ageOverride).trim() !== '') {
+    const n = Number(a.ageOverride); return (isFinite(n) && n >= 0) ? Math.round(n) : null;
+  }
+  if (a.installDate && /^\d{4}-\d{2}-\d{2}/.test(String(a.installDate))) {
+    const d = new Date(String(a.installDate).slice(0, 10) + 'T12:00:00');
+    if (!isNaN(d)) {
+      let age = asOf.getFullYear() - d.getFullYear();
+      const md = asOf.getMonth() - d.getMonth();
+      if (md < 0 || (md === 0 && asOf.getDate() < d.getDate())) age--;
+      return Math.max(0, age);
+    }
+  }
+  const y = effectiveYear(a);
+  return y == null ? null : Math.max(0, asOf.getFullYear() - y);
+}
+function computeRemaining(a) {
+  const life = (a && a.lifeExpectancy !== undefined && a.lifeExpectancy !== null && String(a.lifeExpectancy).trim() !== '')
+    ? Number(a.lifeExpectancy) : null;
+  const age = computeAge(a);
+  if (life == null || !isFinite(life) || age == null) return null;
+  return Math.round((life - age) * 10) / 10;
+}
+/** green = plenty left, amber = ≤15% of life or ≤3 yrs left, red = at/past expectancy */
+function lifeTone(remaining, life) {
+  if (remaining == null) return '';
+  if (remaining <= 0) return 'life-past';
+  const thresh = life != null && isFinite(life) ? Math.max(3, Math.ceil(life * 0.15)) : 3;
+  if (remaining <= thresh) return 'life-warn';
+  return 'life-ok';
+}
+function lifePill(a) {
+  const age = computeAge(a), rem = computeRemaining(a), life = a.lifeExpectancy;
+  if (age == null && rem == null) return '';
+  const tone = lifeTone(rem, life != null && life !== '' ? Number(life) : null);
+  const parts = [];
+  if (age != null) parts.push(`${age}y old`);
+  if (rem != null) parts.push(rem < 0 ? `${Math.abs(rem)}y over` : rem === 0 ? 'at end' : `${rem}y left`);
+  return `<span class="pill life ${tone}" title="Age / remaining service life">${esc(parts.join(' · '))}</span>`;
+}
+function lifeCardHtml(a) {
+  const age = computeAge(a), rem = computeRemaining(a), y = effectiveYear(a);
+  const life = a.lifeExpectancy !== undefined && a.lifeExpectancy !== null && String(a.lifeExpectancy).trim() !== '' ? Number(a.lifeExpectancy) : null;
+  if (age == null && rem == null && y == null && (life == null || !isFinite(life))) return '';
+  const tone = lifeTone(rem, life);
+  const overrideNote = (a.ageOverride !== undefined && a.ageOverride !== null && String(a.ageOverride).trim() !== '') ? ' (manual override)' : '';
+  return `<div class="card life-card">
+    <div class="lbl">Age &amp; remaining life</div>
+    <div class="life-stats">
+      <div><div class="life-n">${y != null ? esc(y) : '—'}</div><div class="life-l">Install / mfr year</div></div>
+      <div><div class="life-n">${age != null ? esc(age) + ' yrs' : '—'}</div><div class="life-l">Age${esc(overrideNote)}</div></div>
+      <div><div class="life-n">${life != null && isFinite(life) ? esc(life) + ' yrs' : '—'}</div><div class="life-l">Life expectancy</div></div>
+      <div class="${tone}"><div class="life-n">${rem == null ? '—' : (rem < 0 ? esc(Math.abs(rem)) + ' yrs over' : rem === 0 ? '0 yrs' : esc(rem) + ' yrs')}</div><div class="life-l">${rem == null ? 'Remaining' : rem < 0 ? 'Past expectancy' : rem === 0 ? 'At end of life' : 'Remaining'}</div></div>
+    </div>
+    <p class="muted small" style="margin:8px 0 0">Age updates automatically from install year/date. Defaults for life expectancy follow typical ASHRAE / industry mid-range values and are editable.</p>
+  </div>`;
+}
+
 
 function toast(msg, ms = 2200) {
   const t = $('#toast'); t.textContent = msg; t.classList.add('show');
@@ -382,7 +464,7 @@ async function renderProject(pid) {
           <div class="t">${esc(a.tag)}</div>
           <div class="sub">${esc([a.manufacturer, a.model, a.capacity].filter(Boolean).join(' · ') || '—')}</div>
           <div class="sub">${esc(locLine(a) || a.areaServed || '')}${pc[a.id] ? ` · 📷 ${pc[a.id]}` : ''}</div></div>
-          <div class="right"><span class="badge">${esc(a.type || '—')}</span>${statusPill(a.status)}</div></a>`).join('');
+          <div class="right"><span class="badge">${esc(a.type || '—')}</span>${statusPill(a.status)}${lifePill(a)}</div></a>`).join('');
   };
   renderList();
   $('#statusChips').onclick = e => { const c = e.target.closest('.chip'); if (c) { f.status = c.dataset.s; renderList(); } };
@@ -426,15 +508,16 @@ async function renderAsset(pid, aid) {
   const photos = await Data.photos(aid);
   const base = `/p/${encodeURIComponent(pid)}/a/${encodeURIComponent(aid)}`;
   setChrome(a.tag, `/p/${encodeURIComponent(pid)}`, `<button class="icon-btn" id="hdrEdit" aria-label="Edit" style="font-size:16px;font-weight:700">Edit</button>`);
-  const rows = FIELDS.filter(fl => !['tag','type','status','notes'].includes(fl.key) && a[fl.key]).map(fl => `<dt>${esc(fl.label)}</dt><dd>${esc(a[fl.key])}</dd>`).join('');
+  const rows = FIELDS.filter(fl => !['tag','type','status','notes','installYear','lifeExpectancy','ageOverride'].includes(fl.key) && a[fl.key]).map(fl => `<dt>${esc(fl.label)}</dt><dd>${esc(a[fl.key])}</dd>`).join('');
   view.innerHTML = `
     <div class="hero"><div style="display:flex;gap:12px;align-items:flex-start">
       <div style="flex:1;min-width:0"><div class="tag">${esc(a.tag)}</div>
-        <div class="meta"><span class="badge">${esc(a.type || '—')}</span>${statusPill(a.status)}</div>
+        <div class="meta"><span class="badge">${esc(a.type || '—')}</span>${statusPill(a.status)}${lifePill(a)}</div>
         <div class="muted small" style="margin-top:8px">${esc(p.name)}</div></div>
       <div class="qr-mini" title="QR for ${esc(a.tag)}">${qrSvg(a.tag)}</div></div></div>
     <div class="card"><div class="lbl">Status — tap to update</div><div class="status-pick" id="stPick">${STATUSES.map(s =>
       `<button data-s="${esc(s)}" class="${(a.status || 'Not started') === s ? 'on ' + STATUS_CLASS[s] : ''}">${esc(s)}</button>`).join('')}</div></div>
+    ${lifeCardHtml(a)}
     <div class="card">${rows ? `<dl class="kv">${rows}</dl>` : '<span class="muted">No details yet. Tap Edit to add manufacturer, model, serial, location…</span>'}</div>
     ${a.notes ? `<div class="card"><div class="lbl">Notes</div><div style="white-space:pre-wrap">${esc(a.notes)}</div></div>` : ''}
     <div class="card"><div class="lbl">Nameplate photos (${photos.length})</div><div class="photos" id="phGrid">
@@ -484,10 +567,11 @@ async function renderAssetForm(pid, aid, q) {
   else {
     a = {tag: '', type: '', status: 'Not started'};
     const from = q.get('from') && await Data.asset(q.get('from'));
-    if (from) ['type','manufacturer','model','capacity','building','floor'].forEach(k => a[k] = from[k] || '');
+    if (from) ['type','manufacturer','model','capacity','building','floor','lifeExpectancy'].forEach(k => a[k] = from[k] || '');
     if (from) a.tag = nextTag(from.tag);
     if (q.get('tag')) a.tag = normTag(q.get('tag'));
     if (!a.type && a.tag) a.type = guessTypeFromTag(a.tag);
+    if (a.type && !a.lifeExpectancy) a.lifeExpectancy = String(defaultLife(a.type));
   }
   const existingPhotos = aid ? await Data.photos(aid) : [];
   const staged = []; const removed = new Set();
@@ -511,7 +595,24 @@ async function renderAssetForm(pid, aid, q) {
       <div class="grid2">${inp('building', 'Building', 'list="dl_bldg"')}${inp('floor', 'Floor', 'list="dl_floor"')}</div>
       ${inp('room', 'Room / location', 'list="dl_room" placeholder="e.g. Mech Rm 101, Roof"')}
       ${inp('areaServed', 'Area served', 'list="dl_area" placeholder="e.g. 2nd floor east wing"')}
-      <div class="field"><label for="f_installDate">Install date</label><input id="f_installDate" name="installDate" type="date" value="${esc(a.installDate)}"></div>
+      <div class="card" style="padding:12px;margin:0 0 14px">
+        <div class="lbl">Age &amp; life expectancy</div>
+        <div class="grid2">
+          <div class="field"><label for="f_installYear">Install / mfr year</label>
+            <input id="f_installYear" name="installYear" inputmode="numeric" pattern="[12][0-9]{3}" maxlength="4" placeholder="e.g. 2008" value="${esc(a.installYear)}"></div>
+          <div class="field"><label for="f_lifeExpectancy">Life expectancy (yrs)</label>
+            <input id="f_lifeExpectancy" name="lifeExpectancy" type="number" inputmode="numeric" min="1" max="100" step="1" placeholder="e.g. 25" value="${esc(a.lifeExpectancy)}"></div>
+        </div>
+        <div class="field"><label for="f_installDate">Install date <span class="muted">(optional)</span></label>
+          <input id="f_installDate" name="installDate" type="date" value="${esc(a.installDate)}"></div>
+        <div class="life-preview" id="lifePreview"></div>
+        <details class="filters" id="ageOverrideDetails" ${a.ageOverride ? 'open' : ''}><summary>Override age manually</summary>
+          <div class="field" style="margin-top:8px"><label for="f_ageOverride">Age override (years)</label>
+            <input id="f_ageOverride" name="ageOverride" type="number" inputmode="numeric" min="0" max="150" step="1" placeholder="Leave blank to auto-calculate" value="${esc(a.ageOverride)}">
+            <p class="muted small" style="margin:6px 0 0">Only fill this if the year is unknown. Clear it to go back to automatic age.</p></div>
+        </details>
+        <p class="muted small" style="margin:8px 0 0">Life expectancy prefills from equipment type (ASHRAE mid-range). Age and remaining life update automatically.</p>
+      </div>
       <div class="field"><label for="f_notes">Notes</label><textarea id="f_notes" name="notes" placeholder="Deficiencies, observations, startup notes…">${esc(a.notes)}</textarea></div>
       <div class="field"><span class="lbl">Nameplate photos</span><div class="photos" id="phGrid"></div></div>
       ${dl('dl_mfr', 'manufacturer')}${dl('dl_bldg', 'building')}${dl('dl_floor', 'floor')}${dl('dl_room', 'room')}${dl('dl_area', 'areaServed')}
@@ -532,8 +633,48 @@ async function renderAssetForm(pid, aid, q) {
     const s = e.target.closest('[data-rms]'); if (s) { staged.splice(+s.dataset.rms, 1); renderPhotos(); }
   };
   let typeAuto = !a.type;
-  $('#f_type').onchange = () => { typeAuto = false; };
-  $('#f_tag').oninput = e => { if (typeAuto) { const g = guessTypeFromTag(e.target.value); $('#f_type').value = g; } };
+  let lifeAuto = !a.lifeExpectancy || (a.type && String(a.lifeExpectancy) === String(defaultLife(a.type)));
+  const refreshLifePreview = () => {
+    const snap = {
+      installYear: $('#f_installYear').value.trim(),
+      installDate: $('#f_installDate').value,
+      lifeExpectancy: $('#f_lifeExpectancy').value.trim(),
+      ageOverride: $('#f_ageOverride').value.trim(),
+    };
+    const age = computeAge(snap), rem = computeRemaining(snap);
+    const life = snap.lifeExpectancy !== '' ? Number(snap.lifeExpectancy) : null;
+    const tone = lifeTone(rem, life);
+    if (age == null && rem == null) { $('#lifePreview').innerHTML = '<p class="muted small" style="margin:4px 0 0">Enter an install year (or date) to see age and remaining life.</p>'; return; }
+    $('#lifePreview').innerHTML = `<div class="life-preview-row">
+      <span>Age: <b>${age != null ? age + ' yrs' : '—'}</b>${snap.ageOverride !== '' ? ' <span class="muted">(override)</span>' : ''}</span>
+      <span class="pill life ${tone}">${rem == null ? 'Remaining: —' : (rem < 0 ? Math.abs(rem) + ' yrs past expectancy' : rem === 0 ? 'At end of life' : rem + ' yrs remaining')}</span>
+    </div>`;
+  };
+  const applyTypeLife = (type) => {
+    if (!type) return;
+    if (lifeAuto || !$('#f_lifeExpectancy').value.trim()) {
+      $('#f_lifeExpectancy').value = String(defaultLife(type));
+      lifeAuto = true;
+    }
+  };
+  $('#f_type').onchange = () => { typeAuto = false; applyTypeLife($('#f_type').value); refreshLifePreview(); };
+  $('#f_lifeExpectancy').oninput = () => { lifeAuto = false; refreshLifePreview(); };
+  $('#f_installYear').oninput = refreshLifePreview;
+  $('#f_ageOverride').oninput = refreshLifePreview;
+  $('#f_installDate').onchange = () => {
+    const d = $('#f_installDate').value;
+    if (d && /^\d{4}/.test(d) && !$('#f_installYear').value.trim()) $('#f_installYear').value = d.slice(0, 4);
+    refreshLifePreview();
+  };
+  $('#f_tag').oninput = e => {
+    if (typeAuto) {
+      const g = guessTypeFromTag(e.target.value);
+      $('#f_type').value = g;
+      if (g) applyTypeLife(g);
+    }
+  };
+  if (a.type && !a.lifeExpectancy) applyTypeLife(a.type);
+  refreshLifePreview();
   $('#scanIntoTag').onclick = () => openScanner(pid, text => { $('#f_tag').value = normTag(extractTag(text)); $('#f_tag').dispatchEvent(new Event('input')); dirty = true; });
   if (isNew && !a.tag) setTimeout(() => { if (!document.activeElement || document.activeElement === document.body) $('#f_tag').focus(); }, 50);
   const cancel = $('#bCancel'); if (cancel) cancel.onclick = async () => { if (!dirty || await confirmBox('Discard changes?', 'Your edits will be lost.', 'Discard', true)) go(back); };
@@ -543,6 +684,24 @@ async function renderAssetForm(pid, aid, q) {
     FIELDS.forEach(fl => { rec[fl.key] = String(fd.get(fl.key) ?? '').trim(); });
     rec.tag = normTag(rec.tag);
     if (!rec.tag) { toast('Tag / Asset ID is required'); $('#f_tag').focus(); return; }
+    if (rec.installYear) {
+      const y = parseYear(rec.installYear);
+      if (y == null) { toast('Install year must be a 4-digit year (e.g. 2008)'); $('#f_installYear').focus(); return; }
+      rec.installYear = String(y);
+    }
+    if (rec.installDate && !rec.installYear) {
+      const y = parseYear(rec.installDate); if (y != null) rec.installYear = String(y);
+    }
+    if (rec.lifeExpectancy !== '') {
+      const n = Number(rec.lifeExpectancy);
+      if (!isFinite(n) || n < 1 || n > 100) { toast('Life expectancy must be 1–100 years'); $('#f_lifeExpectancy').focus(); return; }
+      rec.lifeExpectancy = String(Math.round(n));
+    }
+    if (rec.ageOverride !== '') {
+      const n = Number(rec.ageOverride);
+      if (!isFinite(n) || n < 0 || n > 150) { toast('Age override must be 0–150 years'); $('#f_ageOverride').focus(); return; }
+      rec.ageOverride = String(Math.round(n));
+    } else { delete rec.ageOverride; }
     const dup = assets.find(x => normTag(x.tag) === rec.tag && x.id !== a.id);
     if (dup) {
       if (await confirmBox('Tag already exists', `<b>${esc(rec.tag)}</b> is already used in this project. Tags must be unique so scanning works. Open the existing asset?`, 'Open existing'))
@@ -688,11 +847,15 @@ async function renderLabels(pid, q) {
 }
 
 /* ---------------- Export / import ---------------- */
-const HEADERS = ['Project', ...FIELDS.map(f => f.label), 'Photos', 'Created', 'Last Updated'];
+const EXPORT_FIELDS = FIELDS.filter(f => f.export !== false);
+const HEADERS = ['Project', ...EXPORT_FIELDS.map(f => f.label), 'Age', 'Remaining Life', 'Photos', 'Created', 'Last Updated'];
 function assetRows(project, assets, pc) {
   return assets.slice().sort((a, b) => natCmp(a.tag, b.tag)).map(a => {
     const r = {'Project': project.name};
-    FIELDS.forEach(fl => { r[fl.label] = fl.key === 'status' ? (a.status || 'Not started') : (a[fl.key] || ''); });
+    EXPORT_FIELDS.forEach(fl => { r[fl.label] = fl.key === 'status' ? (a.status || 'Not started') : (a[fl.key] || ''); });
+    const age = computeAge(a), rem = computeRemaining(a);
+    r['Age'] = age != null ? age : '';
+    r['Remaining Life'] = rem != null ? rem : '';
     r['Photos'] = pc[a.id] || 0;
     r['Created'] = a.createdAt ? new Date(a.createdAt).toLocaleString() : '';
     r['Last Updated'] = a.updatedAt ? new Date(a.updatedAt).toLocaleString() : '';
@@ -746,6 +909,7 @@ function mapHeaders(headers) {
   const map = {};
   headers.forEach(h => {
     const k = normKey(h);
+    if (/^(remaining life|remaining|yrs remaining|years remaining)$/.test(k)) return; // computed on export
     const f = FIELDS.find(fl => normKey(fl.label) === k) || FIELDS.find(fl => fl.aliases.some(al => normKey(al) === k));
     if (f && !Object.values(map).includes(f.key)) map[h] = f.key;
   });
@@ -764,7 +928,7 @@ function planImport(rows, existing, pid) {
   const headers = rows.length ? Object.keys(rows[0]) : [];
   const hmap = mapHeaders(headers);
   const byTag = new Map(existing.map(a => [normTag(a.tag), a]));
-  const plan = {create: [], update: [], skipped: 0, hmap, unmapped: headers.filter(h => !hmap[h] && !/^(project|photos|created|last updated)$/i.test(h.trim()))};
+  const plan = {create: [], update: [], skipped: 0, hmap, unmapped: headers.filter(h => !hmap[h] && !/^(project|photos|created|last updated|remaining life|remaining)$/i.test(h.trim()))};
   const seen = new Map();
   rows.forEach(row => {
     const rec = {};
@@ -775,6 +939,26 @@ function planImport(rows, existing, pid) {
     if ('type' in rec) { const t = normalizeType(rec.type); if (t === null) { extra.push(`Type: ${rec.type}`); rec.type = 'Other'; } else rec.type = t; }
     if ('status' in rec) rec.status = normalizeStatus(rec.status);
     if ('installDate' in rec) { const d = toISODate(rec.installDate); if (d === null) { extra.push(`Install date: ${rec.installDate}`); rec.installDate = ''; } else rec.installDate = d; }
+    if ('installYear' in rec) {
+      const y = parseYear(rec.installYear);
+      if (rec.installYear !== '' && y == null) { extra.push(`Install year: ${rec.installYear}`); delete rec.installYear; }
+      else if (y != null) rec.installYear = String(y);
+    }
+    if (!rec.installYear && rec.installDate) { const y = parseYear(rec.installDate); if (y != null) rec.installYear = String(y); }
+    if ('lifeExpectancy' in rec && rec.lifeExpectancy !== '') {
+      const n = Number(String(rec.lifeExpectancy).replace(/[^0-9.]/g, ''));
+      if (!isFinite(n) || n < 1) { extra.push(`Life expectancy: ${rec.lifeExpectancy}`); delete rec.lifeExpectancy; }
+      else rec.lifeExpectancy = String(Math.round(n));
+    }
+    if ('ageOverride' in rec && rec.ageOverride !== '') {
+      // Imported "Age" becomes a manual override only when no install year/date is present;
+      // otherwise prefer calculated age from year/date and drop the override.
+      const n = Number(String(rec.ageOverride).replace(/[^0-9.]/g, ''));
+      if (!isFinite(n) || n < 0) { delete rec.ageOverride; }
+      else if (rec.installYear || rec.installDate) { delete rec.ageOverride; }
+      else rec.ageOverride = String(Math.round(n));
+    }
+    if (!rec.lifeExpectancy && rec.type) rec.lifeExpectancy = String(defaultLife(rec.type));
     if (extra.length) rec.notes = [rec.notes, ...extra].filter(Boolean).join('\n');
     Object.keys(rec).forEach(k => { if (rec[k] === '') delete rec[k]; });
     const cur = seen.get(rec.tag) || byTag.get(rec.tag);
@@ -801,8 +985,10 @@ function importDialog(project, existing) {
     onOpen: d => {
       $('#tplBtn', d).onclick = async () => {
         await loadXLSX();
-        const ws = XLSX.utils.aoa_to_sheet([FIELDS.map(f => f.label), ['AHU-1', 'AHU', 'Trane', 'CSAA012', 'K12345678', '8,000 CFM', 'Main', '1', 'Mech 101', 'East wing', today(), 'Installed', '']]);
-        ws['!cols'] = FIELDS.map(f => ({wch: Math.max(14, f.label.length + 2)}));
+        const cols = EXPORT_FIELDS.map(f => f.label);
+        const sample = ['AHU-1', 'AHU', 'Trane', 'CSAA012', 'K12345678', '8,000 CFM', 'Main', '1', 'Mech 101', 'East wing', '2010', today(), '25', 'Installed', ''];
+        const ws = XLSX.utils.aoa_to_sheet([cols, sample]);
+        ws['!cols'] = cols.map(h => ({wch: Math.max(14, h.length + 2)}));
         const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Assets');
         downloadBlob(new Blob([XLSX.write(wb, {bookType: 'xlsx', type: 'array'})], {type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}), 'asset_import_template.xlsx');
       };
@@ -880,7 +1066,7 @@ async function renderSettings() {
 /* ---------------- boot ---------------- */
 // html5-qrcode can leave a pending video.play() promise when the camera is stopped quickly; that rejection is harmless.
 window.addEventListener('unhandledrejection', e => { const r = e.reason; if (r && r.name === 'AbortError' && /play\(\)/.test(r.message || '')) e.preventDefault(); });
-window.AssetTagger = {Data, DB, buildExport, planImport, parseImportFile, handleScan, normalizeStatus, normalizeType, guessTypeFromTag, nextTag, extractTag, version: APP_VERSION};
+window.AssetTagger = {Data, DB, buildExport, planImport, parseImportFile, handleScan, normalizeStatus, normalizeType, guessTypeFromTag, nextTag, extractTag, computeAge, computeRemaining, defaultLife, LIFE_DEFAULTS, version: APP_VERSION};
 if ('serviceWorker' in navigator && window.isSecureContext && location.protocol !== 'file:') {
   window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js', {scope: './'}).catch(e => console.warn('SW registration failed', e)));
 }
