@@ -1,0 +1,13 @@
+Tag,Equipment,Mfr,Model No,S/N,Size,Bldg,Level,Room,Serves,Install Date,Cx Status,Comments
+CH-1,Chiller,York,YK-500,SN-CH1001,500 ton,Main,B1,Central Plant,Campus,03/15/2026,Started up,Oil pressure trending high
+CH-2,Chiller,York,YK-500,SN-CH1002,500 ton,Main,B1,Central Plant,Campus,03/15/2026,Installed,
+CHWP-1,,Bell & Gossett,e-1510,BG-77821,1200 GPM,Main,B1,Central Plant,CH-1,2026-03-20,Commissioned,
+CHWP-2,Pump,Bell & Gossett,e-1510,BG-77822,1200 GPM,Main,B1,Central Plant,CH-2,2026-03-20,Issue,Coupling misaligned - see deficiency #14
+B-1,Boiler,Cleaver-Brooks,CFC-E 2500,CB-5531,2500 MBH,Main,B1,Boiler Room,Campus,,Not started,
+RTU-1,Rooftop Unit,Carrier,48FC,4012G1234,15 ton,Annex,Roof,Roof,Annex 1st floor,2026-04-02,Installed,
+EF-1,Exhaust Fan,Greenheck,G-120,GH-00912,1200 CFM,Main,Roof,Roof,Toilet rooms,,Commissioned,
+VAV-2-01,VAV,Price,SDV,PR-2201,800 CFM,Main,2,Rm 201,Office 201,,Started up,
+VAV-2-02,VAV,Price,SDV,PR-2202,600 CFM,Main,2,Rm 205,Conf 205,,Not started,
+CT-1,Cooling Tower,BAC,S3E-1424,BAC-9911,600 ton,Main,Roof,Roof,CH-1/CH-2,,Installed,
+UH-1,Unit Heater,Modine,HD-60,MD-1,60 MBH,Main,B1,Stair 1,Stair,sometime spring,Pending,
+,Pump,,,,,,,,,,,row with no tag
