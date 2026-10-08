@@ -2,7 +2,7 @@
    Vanilla JS, data in IndexedDB. Vendor libs (loaded on demand): html5-qrcode, SheetJS (xlsx); qrcode-generator loaded up front. */
 'use strict';
 (() => {
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 const TYPES = ['AHU','RTU','Chiller','Boiler','Pump','VAV','FCU','Exhaust Fan','Cooling Tower','Heat Exchanger','VRF Unit','Other'];
 const STATUSES = ['Not started','Installed','Started up','Commissioned','Issue'];
 const STATUS_CLASS = {'Not started':'s-none','Installed':'s-inst','Started up':'s-start','Commissioned':'s-cx','Issue':'s-issue'};
@@ -36,6 +36,12 @@ const FIELDS = [
   {key:'floor', label:'Floor', aliases:['floor','level','flr']},
   {key:'room', label:'Room / Location', aliases:['room / location','room/location','room','location','room #','room number','space']},
   {key:'areaServed', label:'Area Served', aliases:['area served','serves','served area','zone','area']},
+  {key:'fedFrom', label:'Fed From', aliases:['fed from','fed by','served by','served from','upstream','upstream equipment','upstream unit','supplied by','parent','parent equipment','parent unit','source equipment','fed from equipment']},
+  {key:'controlledBy', label:'Controlled By', aliases:['controlled by','controller','controls','control','bas controller','ddc controller','ddc panel','control panel','bas','controlled from','thermostat']},
+  {key:'powerPanel', label:'Power Panel', aliases:['power panel','panel','electrical panel','panelboard','panel board','breaker panel','elec panel','power source','power','mcc','fed from panel','panel name','panel #','power panel / mcc']},
+  {key:'breaker', label:'Breaker/Circuit', aliases:['breaker/circuit','breaker / circuit','breaker / circuit #','circuit/breaker','breaker','breakers','circuit','circuits','circuit #','circuit number','circuit no','ckt','ckt #','ckts','breaker #','breaker number','breaker no','cb','circuit breaker']},
+  {key:'voltage', label:'Voltage/Phase', aliases:['voltage/phase','voltage / phase','voltage','volts','volt/phase','volts/phase','v/ph','v/ph/hz','voltage/phase/hz','voltage / phase / hz','electrical','power supply']},
+  {key:'disconnect', label:'Disconnect Location', aliases:['disconnect location','disconnect','disconnect loc','disc location','disconnect switch','disconnect switch location','lockout location','loto location','loto point']},
   {key:'installYear', label:'Install Year', aliases:['install year','year installed','manufacture year','year of manufacture','mfg year','year built','built year','install yr','mfr year']},
   {key:'installDate', label:'Install Date', aliases:['install date','installed','installation date','date installed','install']},
   {key:'lifeExpectancy', label:'Life Expectancy', aliases:['life expectancy','life expectancy (years)','expected life','service life','useful life','design life','life (years)','life years']},
@@ -68,6 +74,55 @@ const natCmp = (a, b) => String(a ?? '').localeCompare(String(b ?? ''), undefine
 const slug = s => String(s || 'project').trim().replace(/[^a-z0-9]+/gi, '_').replace(/^_|_$/g, '').slice(0, 40) || 'project';
 const statusPill = s => `<span class="pill ${STATUS_CLASS[s] || 's-none'}">${esc(s || 'Not started')}</span>`;
 const locLine = a => [a.building && `Bldg ${a.building}`, a.floor && `Flr ${a.floor}`, a.room].filter(Boolean).join(' · ');
+/* ---- Relationships (fed from / feeds) & power ----
+   Stored on the asset by TAG (not id) so a not-yet-tagged upstream unit can be referenced and spreadsheets round-trip:
+   fedFrom: "AHU-1" or "AHU-1, CH-1"; controlledBy: free text; powerPanel: "2A3"; breaker: "14,16,18"; voltage: "480V/3ph"; disconnect: free text. */
+const splitTags = s => [...new Set(String(s ?? '').split(/[,;\n]+/).map(normTag).filter(Boolean))];
+const fedList = a => splitTags(a && a.fedFrom);
+const normPanel = s => { const t = normTag(s); return t.replace(/^(PANEL|PANELBOARD|PNL)\b\s*[:#-]?\s*/, '') || t; };
+const normBreaker = s => String(s ?? '').trim().replace(/\s*,\s*/g, ',').replace(/\s+/g, ' ');
+const cktLabel = b => /^(ckt|cb|circuit|breaker|bkr)/i.test(b) ? b : `Ckt ${b}`;
+const powerLine = a => [a.powerPanel && `Panel ${normPanel(a.powerPanel)}`, a.breaker && cktLabel(a.breaker), a.voltage].filter(Boolean).join(' · ');
+const hasPower = a => !!(a && (a.powerPanel || a.breaker || a.voltage || a.disconnect));
+const plural = (n, w) => `${n} ${w}${n === 1 || /s$/i.test(w) ? '' : 's'}`;
+/** "12 VAVs, 1 FCU" */
+const typeSummary = list => { const c = new Map(); list.forEach(a => { const t = a.type || 'unit'; c.set(t, (c.get(t) || 0) + 1); });
+  return [...c.entries()].sort((x, y) => y[1] - x[1] || natCmp(x[0], y[0])).map(([t, n]) => plural(n, t === 'Other' ? 'other unit' : t)).join(', '); };
+/** Tag lookups + reverse "feeds" lists for one project's assets. */
+function relIndex(assets) {
+  const byTag = new Map(), children = new Map();
+  assets.forEach(a => { const t = normTag(a.tag); if (t && !byTag.has(t)) byTag.set(t, a); });
+  assets.forEach(a => fedList(a).forEach(t => { if (t === normTag(a.tag)) return; if (!children.has(t)) children.set(t, []); children.get(t).push(a); }));
+  children.forEach(l => l.sort((x, y) => natCmp(x.tag, y.tag)));
+  return {byTag, children, feeds: tag => children.get(normTag(tag)) || []};
+}
+/** Primary upstream chain, top first: [CH-1, AHU-1] for VAV-1-2. Stops on loops / unknown tags. */
+function upstreamPath(a, idx) {
+  const path = [], seen = new Set([normTag(a.tag)]); let cur = a;
+  while (cur && path.length < 25) {
+    const t = fedList(cur).find(x => x !== normTag(cur.tag)); if (!t) break;
+    if (seen.has(t)) { path.unshift({tag: t, loop: true}); break; }
+    seen.add(t); cur = idx.byTag.get(t); path.unshift({tag: t, asset: cur});
+  }
+  return path;
+}
+/** When a tag is renamed, point other assets' Fed From / Controlled By at the new tag. Returns the changed assets. */
+function renameRefs(assets, selfId, oldTag, newTag) {
+  const o = normTag(oldTag), n = normTag(newTag), changed = [];
+  if (!o || !n || o === n) return changed;
+  assets.forEach(x => {
+    if (x.id === selfId) return; let hit = false;
+    const f = fedList(x);
+    if (f.includes(o)) { x.fedFrom = [...new Set(f.map(t => t === o ? n : t))].filter(t => t !== normTag(x.tag)).join(', '); hit = true; }
+    if (x.controlledBy) {
+      const parts = String(x.controlledBy).split(/\s*,\s*/);
+      if (parts.some(p => normTag(p) === o)) { x.controlledBy = parts.map(p => normTag(p) === o ? n : p).join(', '); hit = true; }
+    }
+    if (hit) changed.push(x);
+  });
+  return changed;
+}
+const VOLTAGES = ['120V/1ph', '208V/1ph', '208V/3ph', '230V/1ph', '230V/3ph', '277V/1ph', '460V/3ph', '480V/3ph', '575V/3ph', '24VAC'];
 function parseYear(v) {
   if (v == null || v === '') return null;
   if (typeof v === 'number' && isFinite(v)) { const y = Math.round(v); return (y >= 1800 && y <= 2100) ? y : null; }
@@ -681,6 +736,8 @@ async function route() {
       if (parts.length === 2) return await renderProject(pid);
       if (parts[2] === 'labels') return await renderLabels(pid, q);
       if (parts[2] === 'parts') return await renderParts(pid, q);
+      if (parts[2] === 'tree') return await renderTree(pid, q);
+      if (parts[2] === 'panels') return await renderPanels(pid, q);
       if (parts[2] === 'a' && parts[3] === 'new') return await renderAssetForm(pid, null, q);
       if (parts[2] === 'a' && parts[3] && parts[4] === 'edit') return await renderAssetForm(pid, parts[3], q);
       if (parts[2] === 'a' && parts[3]) return await renderAsset(pid, parts[3]);
@@ -742,14 +799,19 @@ function projectDialog(p) {
 
 /* ---------------- Project: asset list ---------------- */
 const filterState = JSON.parse(sessionStorage.getItem('at-filters') || '{}');
-const getFilter = pid => filterState[pid] || (filterState[pid] = {q: '', type: '', status: '', building: '', floor: '', sort: 'tag'});
+const getFilter = pid => { const f = filterState[pid] || (filterState[pid] = {q: '', type: '', status: '', building: '', floor: '', sort: 'tag'});
+  if (f.panel === undefined) f.panel = ''; if (f.fed === undefined) f.fed = ''; return f; };
 const saveFilters = () => sessionStorage.setItem('at-filters', JSON.stringify(filterState));
 function applyFilter(assets, f) {
   const q = f.q.trim().toLowerCase();
   let out = assets.filter(a =>
     (!f.type || a.type === f.type) && (!f.status || (a.status || 'Not started') === f.status) &&
     (!f.building || (a.building || '') === f.building) && (!f.floor || (a.floor || '') === f.floor) &&
-    (!q || ['tag','type','manufacturer','model','serial','capacity','building','floor','room','areaServed','notes'].some(k => String(a[k] || '').toLowerCase().includes(q))
+    (!f.panel || (f.panel === NO_PANEL ? !a.powerPanel : normPanel(a.powerPanel) === f.panel)) &&
+    (!f.fed || fedList(a).includes(f.fed)) &&
+    (!q || ['tag','type','manufacturer','model','serial','capacity','building','floor','room','areaServed','notes','fedFrom','controlledBy','powerPanel','breaker','voltage','disconnect'].some(k => String(a[k] || '').toLowerCase().includes(q))
+      || (a.powerPanel && `panel ${normPanel(a.powerPanel)}`.toLowerCase().includes(q))
+      || (a.fedFrom && `fed from ${fedList(a).join(', ')}`.toLowerCase().includes(q))
       || assetParts(a).some(pt => pt.size.toLowerCase().includes(q))));
   const sorters = {
     tag: (a, b) => natCmp(a.tag, b.tag),
@@ -761,6 +823,11 @@ function applyFilter(assets, f) {
   return out.sort(sorters[f.sort] || sorters.tag);
 }
 const uniq = (arr, k) => [...new Set(arr.map(a => a[k]).filter(Boolean))].sort(natCmp);
+const NO_PANEL = '(none)';
+const panelsOf = assets => [...new Set(assets.map(a => a.powerPanel && normPanel(a.powerPanel)).filter(Boolean))].sort(natCmp);
+const parentsOf = assets => [...new Set(assets.flatMap(fedList))].sort(natCmp);
+const relSub = a => { const f = fedList(a), pw = a.powerPanel ? `⚡ ${normPanel(a.powerPanel)}${a.breaker ? ' / ' + a.breaker : ''}` : '';
+  return [f.length && `Fed from ${f.join(', ')}`, pw].filter(Boolean).join(' · '); };
 const options = (vals, sel, allLabel) => `<option value="">${esc(allLabel)}</option>` + vals.map(v => `<option ${v === sel ? 'selected' : ''}>${esc(v)}</option>`).join('');
 
 async function renderProject(pid) {
@@ -768,21 +835,24 @@ async function renderProject(pid) {
   const [assets, pc] = await Promise.all([Data.assets(pid), photoCounts()]);
   const f = getFilter(pid);
   setChrome(p.name, '/', `<button class="icon-btn" id="pMenu" aria-label="Project menu">${ICON.more}</button>`);
-  const anyAdv = f.type || f.building || f.floor || f.sort !== 'tag';
+  const anyAdv = f.type || f.building || f.floor || f.panel || f.fed || f.sort !== 'tag';
+  const pnls = panelsOf(assets), pars = parentsOf(assets);
   view.innerHTML = `
     ${partsReminders([p], assets).map(reminderHtml).join('')}
     <div class="chips" id="statusChips"></div>
-    <div class="search"><span>${ICON.search}</span><input id="q" type="search" placeholder="Search tag, model, serial, room…" value="${esc(f.q)}" autocomplete="off" enterkeyhint="search"></div>
+    <div class="search"><span>${ICON.search}</span><input id="q" type="search" placeholder="Search tag, model, serial, room, panel…" value="${esc(f.q)}" autocomplete="off" enterkeyhint="search"></div>
     <details class="filters" ${anyAdv ? 'open' : ''}><summary>Filters &amp; sort</summary>
       <div class="grid2">
         <div class="field"><label>Type</label><select id="fType">${options(TYPES, f.type, 'All types')}</select></div>
         <div class="field"><label>Building</label><select id="fBldg">${options(uniq(assets, 'building'), f.building, 'All buildings')}</select></div>
         <div class="field"><label>Floor</label><select id="fFloor">${options(uniq(assets, 'floor'), f.floor, 'All floors')}</select></div>
+        <div class="field"><label>Power panel</label><select id="fPanel">${options(pnls, f.panel, 'All panels')}${assets.some(a => !a.powerPanel) ? `<option value="${NO_PANEL}" ${f.panel === NO_PANEL ? 'selected' : ''}>No panel recorded</option>` : ''}</select></div>
+        <div class="field"><label>Fed from</label><select id="fFed">${options(pars, f.fed, 'Any upstream')}</select></div>
         <div class="field"><label>Sort by</label><select id="fSort">${[['tag','Tag'],['type','Type'],['location','Location'],['status','Status'],['updated','Recently updated']].map(([v, l]) => `<option value="${v}" ${f.sort === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
       </div></details>
     <div class="resultbar"><span id="count"></span><button class="linkbtn" id="clearF">Clear filters</button></div>
     <div class="list" id="assetList"></div>
-    <div class="row no-print"><button class="btn sm" id="bExport">Export</button><button class="btn sm" id="bImport">Import</button><button class="btn sm" id="bLabels">${ICON.print} Labels</button><button class="btn sm" id="bParts">🔧 Parts due</button></div>`;
+    <div class="row no-print"><button class="btn sm" id="bExport">Export</button><button class="btn sm" id="bImport">Import</button><button class="btn sm" id="bLabels">${ICON.print} Labels</button><button class="btn sm" id="bParts">🔧 Parts due</button><button class="btn sm" id="bTree">🌳 System tree</button><button class="btn sm" id="bPanels">⚡ By panel</button></div>`;
   setBottomBar(`<button class="btn" id="bScan">${ICON.scan} Scan</button><button class="btn primary" id="bAdd">${ICON.plus} Add asset</button>`);
 
   const renderList = () => {
@@ -792,14 +862,14 @@ async function renderProject(pid) {
       STATUSES.map(s => `<button class="chip ${f.status === s ? 'active' : ''}" data-s="${esc(s)}">${esc(s)}<span class="n">${counts[s] || 0}</span></button>`).join('');
     const list = applyFilter(assets, f);
     $('#count').textContent = assets.length ? `Showing ${list.length} of ${assets.length}` : '';
-    $('#clearF').hidden = !(f.q || f.type || f.status || f.building || f.floor);
+    $('#clearF').hidden = !(f.q || f.type || f.status || f.building || f.floor || f.panel || f.fed);
     $('#assetList').innerHTML = !assets.length
       ? `<div class="empty"><div class="big">🏷️</div><p><b>No assets yet.</b></p><p>Tap <b>Add asset</b>, scan an existing tag, or import a CSV/Excel equipment schedule.</p></div>`
       : !list.length ? `<div class="empty">No assets match these filters.</div>`
       : list.map(a => `<a class="item" href="#/p/${encodeURIComponent(pid)}/a/${encodeURIComponent(a.id)}"><div class="main">
           <div class="t">${esc(a.tag)}</div>
           <div class="sub">${esc([a.manufacturer, a.model, a.capacity].filter(Boolean).join(' · ') || '—')}</div>
-          <div class="sub">${esc(locLine(a) || a.areaServed || '')}${pc[a.id] ? ` · 📷 ${pc[a.id]}` : ''}</div></div>
+          <div class="sub">${esc(locLine(a) || a.areaServed || '')}${pc[a.id] ? ` · 📷 ${pc[a.id]}` : ''}</div>${relSub(a) ? `<div class="sub rel-sub">${esc(relSub(a))}</div>` : ''}</div>
           <div class="right"><span class="badge">${esc(a.type || '—')}</span>${statusPill(a.status)}${lifePill(a)}${partsPill(a)}</div></a>`).join('');
   };
   renderList();
@@ -808,14 +878,18 @@ async function renderProject(pid) {
   $('#fType').onchange = e => { f.type = e.target.value; renderList(); };
   $('#fBldg').onchange = e => { f.building = e.target.value; renderList(); };
   $('#fFloor').onchange = e => { f.floor = e.target.value; renderList(); };
+  $('#fPanel').onchange = e => { f.panel = e.target.value; renderList(); };
+  $('#fFed').onchange = e => { f.fed = e.target.value; renderList(); };
   $('#fSort').onchange = e => { f.sort = e.target.value; renderList(); };
-  $('#clearF').onclick = () => { Object.assign(f, {q: '', type: '', status: '', building: '', floor: ''}); renderProject(pid); };
+  $('#clearF').onclick = () => { Object.assign(f, {q: '', type: '', status: '', building: '', floor: '', panel: '', fed: ''}); renderProject(pid); };
   $('#bAdd').onclick = () => go(`/p/${encodeURIComponent(pid)}/a/new`);
   $('#bScan').onclick = () => openScanner(pid);
   $('#bExport').onclick = () => exportDialog(p, assets, applyFilter(assets, f));
   $('#bImport').onclick = () => importDialog(p, assets);
   $('#bLabels').onclick = () => go(`/p/${encodeURIComponent(pid)}/labels?filtered=1`);
   $('#bParts').onclick = () => go(`/p/${encodeURIComponent(pid)}/parts`);
+  $('#bTree').onclick = () => go(`/p/${encodeURIComponent(pid)}/tree`);
+  $('#bPanels').onclick = () => go(`/p/${encodeURIComponent(pid)}/panels`);
   $('#pMenu').onclick = () => {
     const m = modal({title: p.name, body: `<div class="menu">
       <button class="btn" data-m="edit">✏️ Edit project details</button>
@@ -823,6 +897,8 @@ async function renderProject(pid) {
       <button class="btn" data-m="import">⬆️ Import from Excel / CSV</button>
       <button class="btn" data-m="labels">🖨️ Print QR tag labels</button>
       <button class="btn" data-m="parts">🔧 Filters &amp; belts due / email list</button>
+      <button class="btn" data-m="tree">🌳 System tree (what feeds what)</button>
+      <button class="btn" data-m="panels">⚡ Equipment by electrical panel</button>
       <button class="btn danger" data-m="delete">🗑️ Delete project</button></div>`});
     m.el.addEventListener('click', async e => {
       const b = e.target.closest('[data-m]'); if (!b) return; m.close();
@@ -832,6 +908,8 @@ async function renderProject(pid) {
       if (a === 'import') importDialog(p, assets);
       if (a === 'labels') go(`/p/${encodeURIComponent(pid)}/labels?filtered=1`);
       if (a === 'parts') go(`/p/${encodeURIComponent(pid)}/parts`);
+      if (a === 'tree') go(`/p/${encodeURIComponent(pid)}/tree`);
+      if (a === 'panels') go(`/p/${encodeURIComponent(pid)}/panels`);
       if (a === 'delete' && await confirmBox('Delete project?', `This permanently deletes <b>${esc(p.name)}</b> and all ${assets.length} assets and photos on this device. Export or back up first if you need them.`, 'Delete', true)) {
         await Data.deleteProject(pid); toast('Project deleted'); go('/');
       }
@@ -844,10 +922,10 @@ async function renderAsset(pid, aid) {
   const [p, a] = await Promise.all([Data.project(pid), Data.asset(aid)]);
   if (!p) return go('/', true);
   if (!a) return go(`/p/${encodeURIComponent(pid)}`, true);
-  const photos = await Data.photos(aid);
+  const [photos, projAssets] = await Promise.all([Data.photos(aid), Data.assets(pid)]);
   const base = `/p/${encodeURIComponent(pid)}/a/${encodeURIComponent(aid)}`;
   setChrome(a.tag, `/p/${encodeURIComponent(pid)}`, `<button class="icon-btn" id="hdrEdit" aria-label="Edit" style="font-size:16px;font-weight:700">Edit</button>`);
-  const rows = FIELDS.filter(fl => !['tag','type','status','notes','installYear','lifeExpectancy','ageOverride'].includes(fl.key) && a[fl.key]).map(fl => `<dt>${esc(fl.label)}</dt><dd>${esc(a[fl.key])}</dd>`).join('');
+  const rows = FIELDS.filter(fl => !['tag','type','status','notes','installYear','lifeExpectancy','ageOverride',...REL_KEYS].includes(fl.key) && a[fl.key]).map(fl => `<dt>${esc(fl.label)}</dt><dd>${esc(a[fl.key])}</dd>`).join('');
   const aParts = assetParts(a);
   const partsCard = `<div class="card parts-card" id="partsCard"><div class="lbl">Filters &amp; belts</div>
     ${aParts.length ? aParts.map(pt => { const st = partStatus(pt), nd = partNextDue(pt); return `<div class="part-row"><div class="main">
@@ -866,6 +944,7 @@ async function renderAsset(pid, aid) {
       <div class="qr-mini" title="QR for ${esc(a.tag)}">${qrSvg(a.tag)}</div></div></div>
     <div class="card"><div class="lbl">Status — tap to update</div><div class="status-pick" id="stPick">${STATUSES.map(s =>
       `<button data-s="${esc(s)}" class="${(a.status || 'Not started') === s ? 'on ' + STATUS_CLASS[s] : ''}">${esc(s)}</button>`).join('')}</div></div>
+    ${relCardHtml(pid, a, relIndex(projAssets))}
     ${lifeCardHtml(a)}
     ${partsCard}
     <div class="card">${rows ? `<dl class="kv">${rows}</dl>` : '<span class="muted">No details yet. Tap Edit to add manufacturer, model, serial, location…</span>'}</div>
@@ -916,6 +995,113 @@ async function renderAsset(pid, aid) {
   };
 }
 
+const REL_KEYS = ['fedFrom', 'controlledBy', 'powerPanel', 'breaker', 'voltage', 'disconnect'];
+const assetHref = (pid, a) => `#/p/${encodeURIComponent(pid)}/a/${encodeURIComponent(a.id)}`;
+const newTagHref = (pid, tag) => `#/p/${encodeURIComponent(pid)}/a/new?tag=${encodeURIComponent(tag)}`;
+const panelHref = (pid, panel) => `#/p/${encodeURIComponent(pid)}/panels?panel=${encodeURIComponent(panel)}`;
+function relCardHtml(pid, a, idx) {
+  const fed = fedList(a).filter(t => t !== normTag(a.tag)), feeds = idx.feeds(a.tag), path = upstreamPath(a, idx);
+  const tagLink = t => { const x = idx.byTag.get(t);
+    return x ? `<a class="rel-link" href="${assetHref(pid, x)}"><b>${esc(x.tag)}</b>${x.type ? `<span class="badge">${esc(x.type)}</span>` : ''}<span class="chev">›</span></a>`
+      : `<a class="rel-link missing" href="${newTagHref(pid, t)}" title="Not tagged yet – tap to add it"><b>${esc(t)}</b><span class="muted small">not tagged yet · add</span><span class="chev">+</span></a>`; };
+  const ctrl = String(a.controlledBy || '').split(/\s*,\s*/).filter(Boolean).map(c => { const x = idx.byTag.get(normTag(c));
+    return x && x.id !== a.id ? `<a href="${assetHref(pid, x)}"><b>${esc(x.tag)}</b></a>` : esc(c); }).join(', ');
+  const pw = [a.powerPanel && `<a class="rel-panel" href="${panelHref(pid, normPanel(a.powerPanel))}">Panel ${esc(normPanel(a.powerPanel))}</a>`, a.breaker && `<b>${esc(cktLabel(a.breaker))}</b>`, a.voltage && esc(a.voltage)].filter(Boolean).join(' · ');
+  const rows = [];
+  if (fed.length) rows.push(`<dt>Fed from</dt><dd id="relFed">${fed.map(tagLink).join('')}</dd>`);
+  if (path.length > 1) rows.push(`<dt>System path</dt><dd class="rel-path">${path.map(n => n.asset ? `<a href="${assetHref(pid, n.asset)}">${esc(n.tag)}</a>` : `<span${n.loop ? ' class="over-txt" title="Loop: this chain feeds back on itself"' : ''}>${esc(n.tag)}${n.loop ? ' ↻' : ''}</span>`).join(' › ')} › <b>${esc(a.tag)}</b></dd>`);
+  if (feeds.length) rows.push(`<dt>Feeds (${feeds.length})</dt><dd id="relFeeds"><div class="small muted" style="margin-bottom:6px">${esc(typeSummary(feeds))}</div><div class="rel-chips">${feeds.map(x => `<a class="rel-chip" href="${assetHref(pid, x)}">${esc(x.tag)}</a>`).join('')}</div></dd>`);
+  if (a.controlledBy) rows.push(`<dt>Controlled by</dt><dd id="relCtrl">${ctrl}</dd>`);
+  if (pw) rows.push(`<dt>Power</dt><dd id="relPower">${pw}</dd>`);
+  if (a.disconnect) rows.push(`<dt>Disconnect</dt><dd>${esc(a.disconnect)}</dd>`);
+  const none = !fed.length && !a.controlledBy && !hasPower(a);
+  return `<div class="card rel-card" id="relCard"><div class="lbl">Relationships &amp; power</div>
+    ${rows.length ? `<dl class="kv rel-kv">${rows.join('')}</dl>` : ''}
+    ${none ? `<p class="muted small" style="margin:4px 0">${feeds.length ? 'This unit\'s own feed, controller and power aren\'t recorded.' : 'Not recorded.'} Tap <b>Edit details</b> to add what feeds it (e.g. AHU-1), what controls it, and its panel / breaker.</p>` : ''}
+    <div class="rel-actions"><a class="linkbtn" href="#/p/${encodeURIComponent(pid)}/a/new?fed=${encodeURIComponent(a.tag)}">+ Add unit fed from ${esc(a.tag)}</a>
+      <a class="linkbtn" href="#/p/${encodeURIComponent(pid)}/tree?focus=${encodeURIComponent(normTag(a.tag))}">System tree ›</a></div></div>`;
+}
+
+/* ---------------- System tree (what feeds what) ---------------- */
+async function renderTree(pid, q) {
+  const p = await Data.project(pid); if (!p) return go('/', true);
+  const assets = await Data.assets(pid), idx = relIndex(assets);
+  setChrome(`System tree – ${p.name}`, `/p/${encodeURIComponent(pid)}`);
+  const focus = normTag(q.get('focus') || '');
+  const own = t => { const x = idx.byTag.get(t); return x ? fedList(x).filter(u => u !== t) : []; };
+  const linked = new Set();
+  assets.forEach(a => { const t = normTag(a.tag), f = own(t); if (f.length) { linked.add(t); f.forEach(u => linked.add(u)); } });
+  const reached = new Set();
+  const node = (t, path, parent) => {
+    const a = idx.byTag.get(t), kids = idx.feeds(t), loop = path.has(t);
+    const others = own(t).filter(u => u !== parent);
+    reached.add(t);
+    const pw = a && a.powerPanel ? `<span class="tn-pwr">⚡ ${esc(normPanel(a.powerPanel))}${a.breaker ? ' / ' + esc(a.breaker) : ''}</span>` : '';
+    const row = `<div class="tn-row${t === focus ? ' tn-focus' : ''}" ${t === focus ? 'id="tnFocus"' : ''}>${a
+      ? `<a class="tn-tag" href="${assetHref(pid, a)}">${esc(a.tag)}</a>${a.type ? `<span class="badge">${esc(a.type)}</span>` : ''}`
+      : `<a class="tn-tag missing" href="${newTagHref(pid, t)}">${esc(t)}</a><span class="muted small">not tagged yet</span>`}${pw}
+      ${kids.length && !loop ? `<span class="tn-n" title="Feeds ${kids.length}">${kids.length}</span>` : ''}
+      ${kids.length && !loop && !parent ? `<div class="tn-note small muted">feeds ${esc(typeSummary(kids))}</div>` : ''}
+      ${others.length ? `<div class="tn-note small muted">also fed from ${esc(others.join(', '))}</div>` : ''}
+      ${loop ? '<div class="tn-note small over-txt">↻ loop – this unit is already above in this branch</div>' : ''}</div>`;
+    if (!kids.length || loop) return `<li class="tn-leaf">${row}</li>`;
+    const np = new Set(path); np.add(t);
+    return `<li><details open><summary>${row}</summary><ul>${kids.map(k => node(normTag(k.tag), np, t)).join('')}</ul></details></li>`;
+  };
+  const roots = [...linked].filter(t => !own(t).length).sort((x, y) => idx.feeds(y).length - idx.feeds(x).length || natCmp(x, y));
+  let html = roots.map(t => node(t, new Set(), null)).join('');
+  // anything left only sits inside a loop (A feeds B feeds A): show it from its first tag
+  [...linked].sort(natCmp).forEach(t => { if (!reached.has(t)) { html += node(t, new Set(), null); } });
+  const unlinked = assets.filter(a => !linked.has(normTag(a.tag))).sort((x, y) => natCmp(x.tag, y.tag));
+  const nSys = roots.length;
+  view.innerHTML = `
+    <div class="due-summary"><div><span class="n">${nSys}</span> system${nSys === 1 ? '' : 's'}</div><div><span class="n">${[...linked].filter(t => idx.byTag.has(t)).length}</span> linked</div>${unlinked.length ? `<div><span class="n">${unlinked.length}</span> not linked</div>` : ''}</div>
+    ${linked.size ? `<div class="row no-print" style="margin:6px 0"><button class="btn sm" id="tExpand">Expand all</button><button class="btn sm" id="tCollapse">Collapse all</button><button class="btn sm" id="tPanels">⚡ By panel</button></div>
+      <div class="card tree-card"><ul class="tree" id="tree">${html}</ul></div>`
+      : `<div class="empty"><div class="big">🌳</div><p><b>No relationships yet.</b></p><p>Open an asset → <b>Edit details</b> → <b>Relationships / power</b> and set <b>Fed from</b> (e.g. VAV-1-2 fed from AHU-1). The tree builds itself.</p></div>`}
+    ${unlinked.length ? `<details class="card" ${linked.size ? '' : 'open'}><summary class="lbl" style="margin:0;min-height:40px;display:flex;align-items:center;cursor:pointer">Not linked to anything (${unlinked.length})</summary>
+      <div class="rel-chips" style="margin-top:8px">${unlinked.map(a => `<a class="rel-chip" href="${assetHref(pid, a)}">${esc(a.tag)}</a>`).join('')}</div></details>` : ''}
+    <p class="muted small">A unit fed from two sources appears under both. Tap a tag to open it; tap ▸ to fold a branch.</p>`;
+  const all = open => $$('#tree details').forEach(d => { d.open = open; });
+  const ex = $('#tExpand'); if (ex) { ex.onclick = () => all(true); $('#tCollapse').onclick = () => all(false); $('#tPanels').onclick = () => go(`/p/${encodeURIComponent(pid)}/panels`); }
+  const fe = $('#tnFocus'); if (fe) setTimeout(() => fe.scrollIntoView({block: 'center'}), 50);
+}
+
+/* ---------------- Equipment by electrical panel (shutdowns / LOTO) ---------------- */
+async function renderPanels(pid, q) {
+  const p = await Data.project(pid); if (!p) return go('/', true);
+  const assets = await Data.assets(pid), idx = relIndex(assets);
+  setChrome(`By panel – ${p.name}`, `/p/${encodeURIComponent(pid)}`);
+  const groups = new Map();
+  assets.forEach(a => { const k = a.powerPanel ? normPanel(a.powerPanel) : ''; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(a); });
+  groups.forEach(l => l.sort((x, y) => natCmp(x.breaker || '~', y.breaker || '~') || natCmp(x.tag, y.tag)));
+  const panels = [...groups.keys()].filter(Boolean).sort(natCmp);
+  const sel = q.get('panel') ? normPanel(q.get('panel')) : '';
+  const base = `/p/${encodeURIComponent(pid)}/panels`;
+  const row = a => { const feeds = idx.feeds(a.tag), fed = fedList(a);
+    return `<a class="pn-row" href="${assetHref(pid, a)}"><div class="main">
+      <div><span class="t">${esc(a.tag)}</span> <span class="badge">${esc(a.type || '—')}</span></div>
+      <div class="small muted">${esc([a.voltage, a.disconnect && `Disc: ${a.disconnect}`, locLine(a)].filter(Boolean).join(' · ') || 'No details')}</div>
+      ${fed.length || feeds.length ? `<div class="small muted">${esc([fed.length && `Fed from ${fed.join(', ')}`, feeds.length && `Feeds ${typeSummary(feeds)}`].filter(Boolean).join(' · '))}</div>` : ''}</div>
+      <div class="pn-ckt">${a.breaker ? esc(cktLabel(a.breaker)) : '<span class="muted">Ckt ?</span>'}</div></a>`; };
+  const card = k => { const l = groups.get(k) || [];
+    return `<div class="card pn-card" data-panel="${esc(k)}"><div class="pn-head"><span class="pn-name">Panel ${esc(k)}</span><span class="pn-count">${plural(l.length, 'unit')}</span></div>
+      <div class="small muted" style="margin:-2px 0 4px">${esc(typeSummary(l))}</div>${l.map(row).join('')}</div>`; };
+  const none = groups.get('') || [];
+  view.innerHTML = panels.length ? `
+    <div class="chips no-print" id="pnChips"><button class="chip ${!sel ? 'active' : ''}" data-p="">All<span class="n">${panels.length}</span></button>${panels.map(k => `<button class="chip ${sel === k ? 'active' : ''}" data-p="${esc(k)}">${esc(k)}<span class="n">${groups.get(k).length}</span></button>`).join('')}</div>
+    <div class="row no-print" style="margin:6px 0"><button class="btn sm" id="pnPrint">${ICON.print} Print / PDF</button><button class="btn sm" id="pnTree">🌳 System tree</button></div>
+    ${sel && !groups.has(sel) ? `<div class="notice warn">No equipment on panel <b>${esc(sel)}</b>.</div>` : ''}
+    ${(sel ? [sel].filter(k => groups.has(k)) : panels).map(card).join('')}
+    ${!sel && none.length ? `<details class="card"><summary class="lbl" style="margin:0;min-height:40px;display:flex;align-items:center;cursor:pointer">No panel recorded (${none.length})</summary>
+      <div class="rel-chips" style="margin-top:8px">${none.sort((x, y) => natCmp(x.tag, y.tag)).map(a => `<a class="rel-chip" href="${assetHref(pid, a)}">${esc(a.tag)}</a>`).join('')}</div></details>` : ''}
+    <p class="muted small">Grouped by the <b>Power panel</b> on each asset, sorted by circuit. Use it to see everything that goes dark when a panel or breaker is shut off. Always verify in the field before LOTO.</p>`
+    : `<div class="empty"><div class="big">⚡</div><p><b>No panels recorded yet.</b></p><p>Open an asset → <b>Edit details</b> → <b>Relationships / power</b> and enter the power panel (e.g. 2A3) and breaker / circuit numbers.</p></div>`;
+  const ch = $('#pnChips'); if (ch) ch.onclick = e => { const c = e.target.closest('.chip'); if (c) go(c.dataset.p ? `${base}?panel=${encodeURIComponent(c.dataset.p)}` : base, true); };
+  const pr = $('#pnPrint'); if (pr) pr.onclick = () => window.print();
+  const tr = $('#pnTree'); if (tr) tr.onclick = () => go(`/p/${encodeURIComponent(pid)}/tree`);
+}
+
 /* ---------------- Asset form (new / edit) ---------------- */
 async function renderAssetForm(pid, aid, q) {
   const p = await Data.project(pid); if (!p) return go('/', true);
@@ -925,14 +1111,17 @@ async function renderAssetForm(pid, aid, q) {
   else {
     a = {tag: '', type: '', status: 'Not started'};
     const from = q.get('from') && await Data.asset(q.get('from'));
-    if (from) ['type','manufacturer','model','capacity','building','floor','lifeExpectancy'].forEach(k => a[k] = from[k] || '');
+    // Duplicate / Save & next: same model run → carry type, make/model, location, upstream, controller, panel & voltage (not breaker / disconnect)
+    if (from) ['type','manufacturer','model','capacity','building','floor','lifeExpectancy','fedFrom','controlledBy','powerPanel','voltage'].forEach(k => a[k] = from[k] || '');
     if (from) a.tag = nextTag(from.tag);
     if (from) a.parts = assetParts(from).map(pt => ({...pt, id: uid()}));
     if (q.get('tag')) a.tag = normTag(q.get('tag'));
+    if (q.get('fed')) a.fedFrom = splitTags(q.get('fed')).join(', ');
     if (!a.type && a.tag) a.type = guessTypeFromTag(a.tag);
     if (a.type && !a.lifeExpectancy) a.lifeExpectancy = String(defaultLife(a.type));
   }
   const existingPhotos = aid ? await Data.photos(aid) : [];
+  const relIdx = relIndex(assets), feedsHere = aid ? relIdx.feeds(a.tag).filter(x => x.id !== a.id) : [];
   const staged = []; const removed = new Set();
   const back = aid ? `/p/${encodeURIComponent(pid)}/a/${encodeURIComponent(aid)}` : `/p/${encodeURIComponent(pid)}`;
   setChrome(isNew ? 'New asset' : `Edit ${a.tag}`, back);
@@ -954,6 +1143,19 @@ async function renderAssetForm(pid, aid, q) {
       <div class="grid2">${inp('building', 'Building', 'list="dl_bldg"')}${inp('floor', 'Floor', 'list="dl_floor"')}</div>
       ${inp('room', 'Room / location', 'list="dl_room" placeholder="e.g. Mech Rm 101, Roof"')}
       ${inp('areaServed', 'Area served', 'list="dl_area" placeholder="e.g. 2nd floor east wing"')}
+      <div class="card rel-ed-card" id="relEd" style="padding:12px;margin:0 0 14px">
+        <div class="lbl">Relationships / power</div>
+        <div class="field"><label for="f_fedPick">Fed from / served by</label>
+          <div class="rel-chips" id="fedChips"></div>
+          <div style="display:flex;gap:8px"><input id="f_fedPick" list="dl_tags" placeholder="Pick or type a tag, e.g. AHU-1" autocapitalize="characters" spellcheck="false" enterkeyhint="done">
+          <button type="button" class="btn" id="fedAdd" style="flex:0 0 auto;padding:0 16px">Add</button></div>
+          <input type="hidden" name="fedFrom" id="f_fedFrom" value="${esc(fedList(a).join(', '))}">
+          <p class="muted small" style="margin:6px 0 0">Upstream unit(s): e.g. AHU-1 for a VAV, CH-1 for a pump. Add more than one if needed. Tags that aren't tagged yet are fine.</p></div>
+        ${!isNew && feedsHere.length ? `<p class="small" style="margin:-4px 0 12px">Feeds <b>${feedsHere.length}</b>: ${esc(feedsHere.map(x => x.tag).join(', '))} <span class="muted">(set on those units)</span></p>` : ''}
+        ${inp('controlledBy', 'Controlled by', 'list="dl_ctrl" placeholder="e.g. DDC panel NAE-2, T-stat, VFD-3"')}
+        <div class="grid2">${inp('powerPanel', 'Power panel', 'list="dl_panel" placeholder="e.g. 2A3" autocapitalize="characters" spellcheck="false"')}${inp('breaker', 'Breaker / circuit #', 'placeholder="e.g. 14,16,18" spellcheck="false"')}</div>
+        <div class="grid2">${inp('voltage', 'Voltage / phase', 'list="dl_volt" placeholder="e.g. 480V/3ph"')}${inp('disconnect', 'Disconnect location', 'list="dl_disc" placeholder="e.g. at unit, roof"')}</div>
+      </div>
       <div class="card" style="padding:12px;margin:0 0 14px">
         <div class="lbl">Age &amp; life expectancy</div>
         <div class="grid2">
@@ -981,7 +1183,10 @@ async function renderAssetForm(pid, aid, q) {
       <datalist id="dl_psize">${[...new Set(assets.flatMap(x => assetParts(x).map(pt => pt.size)).filter(Boolean))].sort(natCmp).map(v => `<option value="${esc(v)}">`).join('')}</datalist>
       <div class="field"><label for="f_notes">Notes</label><textarea id="f_notes" name="notes" placeholder="Deficiencies, observations, startup notes…">${esc(a.notes)}</textarea></div>
       <div class="field"><span class="lbl">Nameplate photos</span><div class="photos" id="phGrid"></div></div>
-      ${dl('dl_mfr', 'manufacturer')}${dl('dl_bldg', 'building')}${dl('dl_floor', 'floor')}${dl('dl_room', 'room')}${dl('dl_area', 'areaServed')}
+      ${dl('dl_mfr', 'manufacturer')}${dl('dl_bldg', 'building')}${dl('dl_floor', 'floor')}${dl('dl_room', 'room')}${dl('dl_area', 'areaServed')}${dl('dl_ctrl', 'controlledBy')}${dl('dl_disc', 'disconnect')}
+      <datalist id="dl_panel">${panelsOf(assets).map(v => `<option value="${esc(v)}">`).join('')}</datalist>
+      <datalist id="dl_volt">${[...new Set([...VOLTAGES, ...uniq(assets, 'voltage')])].map(v => `<option value="${esc(v)}">`).join('')}</datalist>
+      <datalist id="dl_tags">${assets.filter(x => x.id !== a.id && x.tag).sort((x, y) => natCmp(x.tag, y.tag)).map(x => `<option value="${esc(x.tag)}">${esc([x.type, locLine(x)].filter(Boolean).join(' · '))}</option>`).join('')}</datalist>
     </form>`;
   setBottomBar(isNew
     ? `<button class="btn" id="bSaveNext">Save &amp; next</button><button class="btn primary" id="bSave">Save</button>`
@@ -1041,6 +1246,26 @@ async function renderAssetForm(pid, aid, q) {
     const r = e.target.closest('[data-rm]'); if (r) { removed.add(r.dataset.rm); dirty = true; renderPhotos(); }
     const s = e.target.closest('[data-rms]'); if (s) { staged.splice(+s.dataset.rms, 1); renderPhotos(); }
   };
+  /* Fed-from picker: chips + datalist input (allows tags that don't exist yet) */
+  let fed = fedList(a);
+  const renderFed = () => {
+    $('#f_fedFrom').value = fed.join(', ');
+    $('#fedChips').innerHTML = fed.map((t, i) => { const x = relIdx.byTag.get(t);
+      return `<span class="rel-chip ed ${x && x.id !== a.id ? '' : 'missing'}">${esc(t)}${x && x.id !== a.id && x.type ? ` <small>${esc(x.type)}</small>` : x ? '' : ' <small>new</small>'}<button type="button" data-rm-fed="${i}" aria-label="Remove ${esc(t)}">×</button></span>`; }).join('');
+  };
+  const addFed = (raw, quiet) => {
+    const add = splitTags(raw); if (!add.length) return false;
+    const self = normTag($('#f_tag').value);
+    let n = 0; add.forEach(t => { if (t === self) { if (!quiet) toast("A unit can't be fed from itself"); return; } if (!fed.includes(t)) { fed.push(t); n++; } });
+    $('#f_fedPick').value = ''; if (n) { dirty = true; renderFed(); } return n > 0;
+  };
+  renderFed();
+  $('#fedAdd').onclick = () => { addFed($('#f_fedPick').value); $('#f_fedPick').focus(); };
+  $('#f_fedPick').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); addFed(e.target.value); } };
+  $('#f_fedPick').oninput = e => { // picking from the datalist (no typing) adds right away
+    const v = normTag(e.target.value); if ((!e.inputType || e.inputType === 'insertReplacementText') && relIdx.byTag.has(v)) addFed(v);
+  };
+  $('#fedChips').onclick = e => { const b = e.target.closest('[data-rm-fed]'); if (b) { fed.splice(+b.dataset.rmFed, 1); dirty = true; renderFed(); } };
   let typeAuto = !a.type;
   let lifeAuto = !a.lifeExpectancy || (a.type && String(a.lifeExpectancy) === String(defaultLife(a.type)));
   const refreshLifePreview = () => {
@@ -1089,6 +1314,7 @@ async function renderAssetForm(pid, aid, q) {
   const cancel = $('#bCancel'); if (cancel) cancel.onclick = async () => { if (!dirty || await confirmBox('Discard changes?', 'Your edits will be lost.', 'Discard', true)) go(back); };
 
   async function save(next) {
+    if ($('#f_fedPick').value.trim()) addFed($('#f_fedPick').value, true);
     const fd = new FormData(form); const rec = {...a};
     FIELDS.forEach(fl => { rec[fl.key] = String(fd.get(fl.key) ?? '').trim(); });
     rec.tag = normTag(rec.tag);
@@ -1118,12 +1344,17 @@ async function renderAssetForm(pid, aid, q) {
       return;
     }
     rec.parts = parts.map(({_custom, ...pt}) => normPart(pt)).filter(pt => pt.size || pt.lastReplaced || pt.dueManual || pt.notes);
+    rec.fedFrom = splitTags(rec.fedFrom).filter(t => t !== rec.tag).join(', ');
+    rec.powerPanel = rec.powerPanel ? normPanel(rec.powerPanel) : '';
+    rec.breaker = normBreaker(rec.breaker);
     rec.id = a.id || uid(); rec.projectId = pid; rec.createdAt = a.createdAt || nowISO();
     await Data.saveAsset(rec);
+    const renamed = !isNew ? renameRefs(assets, rec.id, a.tag, rec.tag) : [];
+    for (const x of renamed) await Data.saveAsset(x);
     for (const id of removed) await Data.deletePhoto(id);
     for (const b of staged) await Data.addPhoto(rec.id, b);
     await Data.saveProject(p);
-    toast(`${rec.tag} saved`);
+    toast(renamed.length ? `${rec.tag} saved – updated ${plural(renamed.length, 'link')} from ${normTag(a.tag)}` : `${rec.tag} saved`, renamed.length ? 3500 : 2200);
     if (next) go(`/p/${encodeURIComponent(pid)}/a/new?from=${encodeURIComponent(rec.id)}&t=${Date.now()}`);
     else go(`/p/${encodeURIComponent(pid)}/a/${encodeURIComponent(rec.id)}`, isNew);
   }
@@ -1258,12 +1489,14 @@ async function renderLabels(pid, q) {
 
 /* ---------------- Export / import ---------------- */
 const EXPORT_FIELDS = FIELDS.filter(f => f.export !== false);
-const HEADERS = ['Project', ...EXPORT_FIELDS.map(f => f.label), 'Age', 'Remaining Life', 'Filters & Belts', 'Photos', 'Created', 'Last Updated'];
+const HEADERS = ['Project', ...EXPORT_FIELDS.flatMap(f => f.key === 'fedFrom' ? [f.label, 'Feeds'] : [f.label]), 'Age', 'Remaining Life', 'Filters & Belts', 'Photos', 'Created', 'Last Updated'];
 const partsSummary = a => assetParts(a).map(pt => `${pt.qty}x ${pt.kind} ${pt.size || '(size not set)'} (${freqLabel(pt.freq).toLowerCase()}, next due ${partNextDue(pt) || 'not set'})`).join('; ');
-function assetRows(project, assets, pc) {
+function assetRows(project, assets, pc, idx) {
+  idx = idx || relIndex(assets);
   return assets.slice().sort((a, b) => natCmp(a.tag, b.tag)).map(a => {
     const r = {'Project': project.name};
     EXPORT_FIELDS.forEach(fl => { r[fl.label] = fl.key === 'status' ? (a.status || 'Not started') : (a[fl.key] || ''); });
+    r['Feeds'] = idx.feeds(a.tag).map(x => x.tag).join(', ');
     const age = computeAge(a), rem = computeRemaining(a);
     r['Age'] = age != null ? age : '';
     r['Remaining Life'] = rem != null ? rem : '';
@@ -1277,7 +1510,8 @@ function assetRows(project, assets, pc) {
 async function buildExport(project, assets, fmt) {
   await loadXLSX();
   const pc = await photoCounts();
-  const rows = assetRows(project, assets, pc);
+  let all = assets; try { if (project.id) { const x = await Data.assets(project.id); if (x.length) all = x; } } catch (e) {}
+  const rows = assetRows(project, assets, pc, relIndex(all)); // "Feeds" always reflects the whole project
   const ws = XLSX.utils.json_to_sheet(rows, {header: HEADERS});
   ws['!cols'] = HEADERS.map(h => ({wch: Math.min(45, Math.max(h.length + 2, ...rows.map(r => String(r[h] ?? '').length + 1)))}));
   if (rows.length) ws['!autofilter'] = {ref: XLSX.utils.encode_range({s: {r: 0, c: 0}, e: {r: rows.length, c: HEADERS.length - 1}})};
@@ -1302,6 +1536,7 @@ async function buildExport(project, assets, fmt) {
   STATUSES.forEach(s => sum.push([s, assets.filter(a => (a.status || 'Not started') === s).length]));
   sum.push([], ['Equipment type', 'Count']);
   TYPES.forEach(t => { const n = assets.filter(a => a.type === t).length; if (n) sum.push([t, n]); });
+  sum.push([], ['Assets with Fed From set', assets.filter(a => fedList(a).length).length], ['Assets with a power panel', assets.filter(a => a.powerPanel).length], ['Power panels', panelsOf(assets).join(', ')]);
   sum.push([], ['Filter / belt line items', pRows.length], ['Overdue', pRows.filter(r => r['Due Status'] === 'Overdue').length], ['Due next month', pRows.filter(r => r['Due Status'] === 'Due next month').length]);
   const ws2 = XLSX.utils.aoa_to_sheet(sum); ws2['!cols'] = [{wch: 22}, {wch: 40}];
   XLSX.utils.book_append_sheet(wb, ws2, 'Summary');
@@ -1414,7 +1649,7 @@ function planImport(rows, existing, pid) {
   const headers = rows.length ? Object.keys(rows[0]) : [];
   const hmap = mapHeaders(headers);
   const byTag = new Map(existing.map(a => [normTag(a.tag), a]));
-  const plan = {create: [], update: [], skipped: 0, hmap, unmapped: headers.filter(h => !hmap[h] && !/^(project|photos|created|last updated|remaining life|remaining|filters & belts)$/i.test(h.trim()))};
+  const plan = {create: [], update: [], skipped: 0, hmap, unmapped: headers.filter(h => !hmap[h] && !/^(project|photos|created|last updated|remaining life|remaining|filters & belts|feeds)$/i.test(h.trim()))};
   const seen = new Map();
   rows.forEach(row => {
     const rec = {};
@@ -1424,6 +1659,9 @@ function planImport(rows, existing, pid) {
     const extra = [];
     if ('type' in rec) { const t = normalizeType(rec.type); if (t === null) { extra.push(`Type: ${rec.type}`); rec.type = 'Other'; } else rec.type = t; }
     if ('status' in rec) rec.status = normalizeStatus(rec.status);
+    if ('fedFrom' in rec) rec.fedFrom = splitTags(rec.fedFrom).filter(t => t !== rec.tag).join(', ');
+    if ('powerPanel' in rec) rec.powerPanel = rec.powerPanel ? normPanel(rec.powerPanel) : '';
+    if ('breaker' in rec) rec.breaker = normBreaker(rec.breaker instanceof Date ? '' : rec.breaker);
     if ('installDate' in rec) { const d = toISODate(rec.installDate); if (d === null) { extra.push(`Install date: ${rec.installDate}`); rec.installDate = ''; } else rec.installDate = d; }
     if ('installYear' in rec) {
       const y = parseYear(rec.installYear);
@@ -1463,7 +1701,7 @@ function planImport(rows, existing, pid) {
 }
 function importDialog(project, existing) {
   modal({title: 'Import assets', body: `
-    <p>Import an equipment list from <b>Excel (.xlsx)</b> or <b>CSV</b>. The first row must be column headers, e.g. <i>Tag, Type, Manufacturer, Model, Serial, Building, Floor, Room, Area Served, Status</i>. Column names are matched loosely.</p>
+    <p>Import an equipment list from <b>Excel (.xlsx)</b> or <b>CSV</b>. The first row must be column headers, e.g. <i>Tag, Type, Manufacturer, Model, Serial, Building, Floor, Room, Area Served, Fed From, Controlled By, Power Panel, Breaker/Circuit, Voltage/Phase, Disconnect Location, Status</i>. Column names are matched loosely.</p>
     <p class="muted small">Rows whose tag already exists in this project update that asset (blank cells don't overwrite). New tags are added. A <b>Parts</b> sheet (Asset Tag, Part Type, Size / Part #, Qty, Frequency, Last Replaced, Next Due) imports filters &amp; belts and replaces the filter/belt list of each asset it lists.</p>
     <label class="btn primary block">Choose file…<input type="file" id="impFile" hidden accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"></label>
     <div class="row"><button class="btn sm" id="tplBtn">Download blank template</button></div>
@@ -1472,8 +1710,10 @@ function importDialog(project, existing) {
       $('#tplBtn', d).onclick = async () => {
         await loadXLSX();
         const cols = EXPORT_FIELDS.map(f => f.label);
-        const sample = ['AHU-1', 'AHU', 'Trane', 'CSAA012', 'K12345678', '8,000 CFM', 'Main', '1', 'Mech 101', 'East wing', '2010', today(), '25', 'Installed', ''];
-        const ws = XLSX.utils.aoa_to_sheet([cols, sample]);
+        const ex1 = {tag: 'AHU-1', type: 'AHU', manufacturer: 'Trane', model: 'CSAA012', serial: 'K12345678', capacity: '8,000 CFM', building: 'Main', floor: '1', room: 'Mech 101', areaServed: 'East wing',
+          controlledBy: 'DDC panel NAE-1', powerPanel: '2A3', breaker: '14,16,18', voltage: '480V/3ph', disconnect: 'At unit', installYear: '2010', installDate: today(), lifeExpectancy: '25', status: 'Installed'};
+        const ex2 = {tag: 'VAV-1-1', type: 'VAV', manufacturer: 'Price', model: 'SDV', building: 'Main', floor: '1', room: 'Rm 110', fedFrom: 'AHU-1', controlledBy: 'VAV-1-1 DDC', powerPanel: '2A3', breaker: '20', voltage: '120V/1ph', lifeExpectancy: '20', status: 'Not started'};
+        const ws = XLSX.utils.aoa_to_sheet([cols, ...[ex1, ex2].map(x => EXPORT_FIELDS.map(f => x[f.key] || ''))]);
         ws['!cols'] = cols.map(h => ({wch: Math.max(14, h.length + 2)}));
         const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Assets');
         const pCols = ['Asset Tag', 'Part Type', 'Size / Part #', 'Qty', 'Frequency', 'Last Replaced', 'Next Due', 'Part Notes'];
@@ -1561,6 +1801,7 @@ async function renderSettings() {
 // html5-qrcode can leave a pending video.play() promise when the camera is stopped quickly; that rejection is harmless.
 window.addEventListener('unhandledrejection', e => { const r = e.reason; if (r && r.name === 'AbortError' && /play\(\)/.test(r.message || '')) e.preventDefault(); });
 window.AssetTagger = {Data, DB, buildExport, planImport, parseImportFile, handleScan, normalizeStatus, normalizeType, guessTypeFromTag, nextTag, extractTag, computeAge, computeRemaining, defaultLife, LIFE_DEFAULTS,
+  splitTags, fedList, normPanel, relIndex, upstreamPath, renameRefs, powerLine, typeSummary, applyFilter, FIELDS,
   addMonths, normPart, partNextDue, partStatus, partHits, collectParts, partTotals, partsContext, partsEmail, parseEmails, parseFreq, applyPartsImport, buildPartsXlsx, version: APP_VERSION};
 if ('serviceWorker' in navigator && window.isSecureContext && location.protocol !== 'file:') {
   window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js', {scope: './'}).catch(e => console.warn('SW registration failed', e)));

@@ -1,4 +1,4 @@
-# Asset Tagger (v1.2.0)
+# Asset Tagger (v1.3.0)
 
 Offline-first, mobile-first web app for tagging HVAC / mechanical equipment on job sites
 (AHUs, RTUs, chillers, boilers, pumps, VAVs, FCUs, exhaust fans, cooling towers, heat exchangers, VRF units…).
@@ -12,7 +12,8 @@ Plain static files. No build step, no server code, no account. All data stays in
   status (Not started / Installed / Started up / Commissioned / Issue), notes, nameplate photos
   taken with the phone camera (resized to about 1600 px JPEG to save space).
 - **Fast field entry**: equipment type is guessed from the tag prefix (AHU-, RTU-, CH-, B-, P-/CHWP-, VAV-, FCU-, EF-, CT-, HX-, VRF-),
-  "Save & next" opens a new asset with the next tag number (VAV-2-01 → VAV-2-02) and the same type, manufacturer, model, building and floor.
+  "Save & next" opens a new asset with the next tag number (VAV-2-01 → VAV-2-02) and the same type, manufacturer, model, building and floor,
+  plus the same Fed from, Controlled by, power panel and voltage (not the breaker number). Duplicate does the same.
   Autocomplete suggests manufacturer, building, floor, room and area-served values already used. One-tap status change on the asset page.
 - **Scan QR codes and barcodes** (QR, Data Matrix, Code 128/39/93, EAN/UPC, ITF, PDF417…) with html5-qrcode.
   If the tag is found, the asset opens. If not, a new asset form opens with the tag filled in. You can also scan from a photo
@@ -34,6 +35,17 @@ Plain static files. No build step, no server code, no account. All data stays in
   **Email this list** opens the phone's mail app with the To (project "Parts order email(s)"), subject and a plain-text body
   (totals first, then per-equipment breakdown) filled in. Also: Share text, Copy, Download Excel, Share Excel (to attach the file).
   The home screen shows a reminder banner the month before parts are due.
+- **Relationships & power** (what feeds / controls / powers each unit): on the asset form, *Relationships / power* has
+  **Fed from / served by** (pick a tag from the project or type one that isn't tagged yet; more than one allowed, e.g. a pump fed from CH-1 and B-1),
+  **Controlled by** (free text: DDC panel, thermostat, VFD…), **Power panel** (e.g. 2A3), **Breaker / circuit #** (e.g. 14,16,18),
+  **Voltage / phase** and **Disconnect location**. The asset page shows *Fed from* (tap to open it), *Feeds (N)* (every unit that lists this one,
+  e.g. "AHU-1 feeds 12 VAVs"), the upstream system path (CH-1 › AHU-1 › VAV-1-2), *Controlled by* and *Power* (Panel 2A3 · Ckt 14,16,18 · 480V/3ph).
+  "+ Add unit fed from AHU-1" starts a new asset already linked. Renaming a tag updates the Fed from / Controlled by references that pointed at it.
+- **System tree** per project (AHU-1 › VAV-1-1, VAV-1-2…; a unit with two sources shows under both; unlinked units listed separately) and
+  **By panel** view (equipment grouped by electrical panel, sorted by circuit, printable) for shutdowns / LOTO planning.
+  Search finds assets by panel ("2A3" or "panel 2A3") and by fed-from tag; the list can be filtered by power panel and by fed-from unit.
+  Export adds columns *Fed From, Feeds* (computed)*, Controlled By, Power Panel, Breaker/Circuit, Voltage/Phase, Disconnect Location*; import matches
+  them loosely (Fed By, Served By, Panel, Ckt #, Circuit, Volts, Disconnect…). Older data and backups keep working (fields are simply blank).
 - **Backup / restore** of all projects, assets and photos as a single .json file.
 - **Installable PWA**: a service worker caches everything, so the app opens and works with no signal after the first visit.
 
@@ -72,6 +84,8 @@ Any static host works. Upload the folder contents as-is.
 - Data lives only in that phone's browser. Clearing site data, uninstalling, or (on iPhone) not using a non-installed
   site for weeks can erase it. Install the app to the home screen, allow "storage protection", and **back up regularly**.
 - There's no multi-user sync between devices yet. Use backup/restore or export/import to move data.
+- Relationships are stored by tag within a project. Deleting an asset leaves other units pointing at its tag (shown as "not tagged yet");
+  tags renamed by a spreadsheet import (rather than in the app) are not re-pointed. The panel view is a planning aid: always verify in the field before LOTO.
 - Spreadsheet exports don't include photos (they show a photo count). The JSON backup does include them.
 - When the app is updated, the new version loads on the second launch (stale-while-revalidate cache).
   Bump `CACHE` in sw.js with each release.

@@ -1,5 +1,5 @@
 /* Asset Tagger service worker: precache app shell + libraries so the app works with no signal. */
-const CACHE = 'asset-tagger-v1.2.0';
+const CACHE = 'asset-tagger-v1.3.0';
 const ASSETS = [
   './', './index.html', './app.js', './styles.css', './manifest.webmanifest',
   './vendor/qrcode-generator.js', './vendor/html5-qrcode.min.js', './vendor/xlsx.full.min.js',
