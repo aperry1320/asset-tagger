@@ -155,3 +155,49 @@ input.tag-input::placeholder{text-transform:none;font-weight:500;letter-spacing:
 .life-card .life-past .life-n,.life-card .life-past .life-l{color:#c62828}
 .life-preview{margin:8px 0 4px}
 .life-preview-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between}
+
+/* Filters & belts (maintenance parts) */
+.part-ed{border:1px solid var(--line);border-radius:12px;padding:10px;margin:0 0 10px;background:var(--bg)}
+.part-ed-top{display:flex;gap:8px;align-items:center;margin-bottom:10px}
+.part-ed-top select{flex:1;min-width:0}
+.part-ed-top .qty{display:flex;align-items:center;gap:6px;font-weight:650;color:var(--muted);font-size:15px;flex:0 0 auto}
+.part-ed-top .qty input{width:78px}
+.part-ed-top .part-rm{color:var(--danger);min-width:44px;padding:0 4px}
+.due-auto{min-height:var(--tap);display:flex;align-items:center;gap:6px;padding:0 2px;flex-wrap:wrap}
+.part-row,.due-row{display:flex;gap:10px;align-items:center;padding:10px 0;border-top:1px solid var(--line)}
+.parts-card .lbl + .part-row{border-top:0;padding-top:4px}
+.part-row .main,.due-row .main{flex:1;min-width:0;word-break:break-word}
+.part-row .btn,.due-row .btn{flex:0 0 auto}
+.pill.pt-over{background:var(--s-issue)} .pill.pt-soon{background:var(--s-start)} .pill.pt-next{background:#a86500}
+.pill.pt-ok{background:var(--s-cx)} .pill.pt-none{background:var(--s-none)}
+.pill.pt-pill{font-size:13px}
+.over-txt{color:var(--s-issue)}
+.due-banner{display:flex;gap:10px;align-items:flex-start;text-decoration:none;color:inherit;border:1px solid #f0b86e;background:#fff4e5}
+.due-banner.done{background:var(--primary-soft);border-color:var(--line)}
+.due-banner .db-ico{font-size:22px;line-height:1.2}
+.due-banner .db-main{flex:1;min-width:0}
+.due-banner .db-over{color:var(--s-issue);font-weight:700;margin-top:2px}
+.due-banner .db-cta{color:var(--primary);font-weight:700;margin-top:4px}
+@media (prefers-color-scheme: dark){.due-banner{background:#3a2a10;border-color:#6d4a14}.due-banner.done{background:var(--primary-soft);border-color:var(--line)}}
+.month-nav{display:flex;gap:8px}
+.month-nav select{flex:1;min-width:0}
+.month-nav .btn{flex:0 0 52px;font-size:26px;padding:0}
+label.chk{display:flex;gap:10px;align-items:center;min-height:44px;margin-top:8px;font-size:16px}
+label.chk input{width:24px;min-height:24px;flex:0 0 auto}
+.due-summary{display:flex;gap:18px;flex-wrap:wrap;margin:8px 2px;font-size:15px;color:var(--muted)}
+.due-summary .n{font-size:24px;font-weight:800;color:var(--text);margin-right:2px}
+.due-summary .over-txt,.due-summary .over-txt .n{color:var(--s-issue)}
+ul.totals{list-style:none;margin:4px 0 0;padding:0}
+ul.totals li{display:flex;gap:10px;align-items:center;padding:9px 0;border-top:1px solid var(--line)}
+ul.totals li:first-child{border-top:0}
+ul.totals .q{font-size:21px;font-weight:800;min-width:54px}
+ul.totals .s{flex:1;font-weight:650;word-break:break-word}
+.due-asset .due-head{display:flex;gap:8px;align-items:center;text-decoration:none;color:inherit;min-height:40px}
+.due-asset .due-head .t{font-size:19px;font-weight:750;word-break:break-word}
+.due-asset .due-head .chev{margin-left:auto}
+.due-asset.is-over{border-left:5px solid var(--s-issue)}
+.due-loc{margin:0 0 4px}
+.btn.disabled{opacity:.5}
+.grid2 > .field{min-width:0}
+.part-ed input[type=date]{min-width:0;max-width:100%;padding-left:8px;padding-right:6px}
+@media (min-width:381px){.part-ed .grid2{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}}

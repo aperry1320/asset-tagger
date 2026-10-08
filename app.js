@@ -2,7 +2,7 @@
    Vanilla JS, data in IndexedDB. Vendor libs (loaded on demand): html5-qrcode, SheetJS (xlsx); qrcode-generator loaded up front. */
 'use strict';
 (() => {
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 const TYPES = ['AHU','RTU','Chiller','Boiler','Pump','VAV','FCU','Exhaust Fan','Cooling Tower','Heat Exchanger','VRF Unit','Other'];
 const STATUSES = ['Not started','Installed','Started up','Commissioned','Issue'];
 const STATUS_CLASS = {'Not started':'s-none','Installed':'s-inst','Started up':'s-start','Commissioned':'s-cx','Issue':'s-issue'};
@@ -324,6 +324,332 @@ function confirmBox(title, msg, okLabel = 'OK', danger = false) {
   });
 }
 
+/* ---------------- Filters & belts (maintenance parts) ---------------- */
+const PART_KINDS = ['Filter', 'Belt', 'Other'];
+const FREQS = [[1, 'Monthly'], [2, 'Every 2 months'], [3, 'Quarterly'], [4, 'Every 4 months'], [6, 'Semi-annual'], [12, 'Annual']];
+const DEFAULT_FREQ = {Filter: 3, Belt: 6, Other: 6};
+const MAILTO_MAX = 6000; // keep the whole mailto: URL well inside what phone mail apps accept
+const freqLabel = m => { m = +m; const f = FREQS.find(x => x[0] === m); return f ? f[1] : (m > 0 ? `Every ${m} months` : '—'); };
+function addMonths(iso, n) {
+  const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})/); if (!m) return '';
+  let y = +m[1], mo = +m[2] - 1 + Math.round(+n || 0);
+  y += Math.floor(mo / 12); mo = ((mo % 12) + 12) % 12;
+  const last = new Date(y, mo + 1, 0).getDate();
+  return `${y}-${String(mo + 1).padStart(2, '0')}-${String(Math.min(+m[3], last)).padStart(2, '0')}`;
+}
+const monthKey = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+const shiftMonth = (key, n) => addMonths(key + '-01', n).slice(0, 7);
+const nextMonthKey = () => shiftMonth(monthKey(), 1);
+const monthLabel = key => { const [y, m] = key.split('-').map(Number); return new Date(y, m - 1, 1).toLocaleDateString('en-US', {month: 'long', year: 'numeric'}); };
+const monthShort = key => { const [y, m] = key.split('-').map(Number); return new Date(y, m - 1, 1).toLocaleDateString('en-US', {month: 'long'}); };
+const fmtDate = iso => { if (!iso) return ''; const d = new Date(String(iso).slice(0, 10) + 'T12:00:00'); return isNaN(d) ? String(iso) : d.toLocaleDateString('en-US', {month: 'short', day: 'numeric', year: 'numeric'}); };
+function normKind(k) {
+  const s = String(k ?? '').trim().toLowerCase();
+  if (!s) return '';
+  if (/filt|merv|media|pleat/.test(s)) return 'Filter';
+  if (/belt/.test(s)) return 'Belt';
+  return 'Other';
+}
+function normPart(p) {
+  p = p || {};
+  const kind = normKind(p.kind) || 'Filter';
+  let freq = Math.round(Number(p.freq)); if (!isFinite(freq) || freq < 1) freq = DEFAULT_FREQ[kind]; if (freq > 120) freq = 120;
+  let qty = Math.round(Number(p.qty)); if (!isFinite(qty) || qty < 1) qty = 1; if (qty > 9999) qty = 9999;
+  const lastReplaced = toISODate(p.lastReplaced) || '';
+  return {id: p.id || uid(), kind, size: String(p.size ?? '').trim(), qty, freq, lastReplaced,
+    dueManual: lastReplaced ? '' : (toISODate(p.dueManual) || ''), notes: String(p.notes ?? '').trim()};
+}
+const assetParts = a => Array.isArray(a && a.parts) ? a.parts.map(normPart) : [];
+/** Next due = last replaced + frequency; with no last-replaced date, the manually entered next due date. */
+const partNextDue = p => p.lastReplaced ? addMonths(p.lastReplaced, p.freq) : (p.dueManual || '');
+function partStatus(p, t = today()) {
+  const d = partNextDue(p); if (!d) return {key: 'none', label: 'No date set', cls: 'pt-none'};
+  if (d < t) return {key: 'overdue', label: 'Overdue', cls: 'pt-over'};
+  const mk = d.slice(0, 7);
+  if (mk === t.slice(0, 7)) return {key: 'this', label: 'Due this month', cls: 'pt-soon'};
+  if (mk === shiftMonth(t.slice(0, 7), 1)) return {key: 'next', label: 'Due next month', cls: 'pt-next'};
+  return {key: 'ok', label: 'Scheduled', cls: 'pt-ok'};
+}
+/** Occurrences of a part relative to service month mk.
+    overdue: next due is before today (schedule restarts once it's replaced, so no projection).
+    month:   due inside mk (directly, or projected forward by the frequency from an upcoming date).
+    earlier: due between today and the start of mk. */
+function partHits(p, mk, t = today()) {
+  const d = partNextDue(p); if (!d) return [];
+  const start = mk + '-01', end = addMonths(start, 1);
+  if (d < t) return [{due: d, bucket: 'overdue'}];
+  if (d >= end) return [];
+  if (d >= start) return [{due: d, bucket: 'month'}];
+  const out = [{due: d, bucket: 'earlier'}];
+  for (let k = 1; k < 1000; k++) {
+    const dk = addMonths(d, k * p.freq); if (dk >= end) break;
+    if (dk >= start) { out.push({due: dk, bucket: 'month', projected: true}); break; }
+  }
+  return out;
+}
+function collectParts(projects, assets, mk, t = today()) {
+  const pmap = new Map(projects.map(p => [p.id, p])); const hits = [];
+  assets.forEach(a => {
+    const p = pmap.get(a.projectId); if (!p) return;
+    assetParts(a).forEach(part => partHits(part, mk, t).forEach(h => hits.push({project: p, asset: a, part, ...h})));
+  });
+  return hits;
+}
+function groupHits(hits) {
+  const m = new Map();
+  hits.forEach(h => { const g = m.get(h.asset.id) || {project: h.project, asset: h.asset, items: []}; g.items.push(h); m.set(h.asset.id, g); });
+  const out = [...m.values()];
+  out.forEach(g => g.items.sort((x, y) => natCmp(x.due, y.due) || PART_KINDS.indexOf(x.part.kind) - PART_KINDS.indexOf(y.part.kind)));
+  return out.sort((x, y) => natCmp(x.project.name, y.project.name) || natCmp(x.asset.tag, y.asset.tag));
+}
+const sizeKey = s => String(s || '').trim().replace(/(\d)\s*[x×]\s*(?=\d)/gi, '$1X').replace(/\s+/g, ' ').toUpperCase();
+function partTotals(hits) {
+  const m = new Map();
+  hits.forEach(h => {
+    const k = h.part.kind + '|' + sizeKey(h.part.size);
+    const t = m.get(k) || {kind: h.part.kind, qty: 0, tags: new Set(), variants: new Map()};
+    t.qty += h.part.qty; t.tags.add(h.asset.tag); t.variants.set(h.part.size, (t.variants.get(h.part.size) || 0) + h.part.qty); m.set(k, t);
+  });
+  // show the most-used spelling of each size (e.g. "20x25x2 MERV 13" over "20 x 25 x 2 merv 13")
+  return [...m.values()].map(({variants, ...t}) => ({...t, size: [...variants.entries()].sort((a, b) => b[1] - a[1])[0][0], tags: [...t.tags].sort(natCmp)}))
+    .sort((a, b) => PART_KINDS.indexOf(a.kind) - PART_KINDS.indexOf(b.kind) || natCmp(sizeKey(a.size), sizeKey(b.size)));
+}
+const kindCounts = hits => { const c = {}; hits.forEach(h => { c[h.part.kind] = (c[h.part.kind] || 0) + h.part.qty; }); return c; };
+const kindSummary = hits => { const c = kindCounts(hits); return PART_KINDS.filter(k => c[k]).map(k => `${c[k]} ${k === 'Other' ? 'other' : k.toLowerCase()}${c[k] === 1 ? '' : 's'}`).join(', '); };
+function parseEmails(s) {
+  const list = String(s || '').split(/[,;\s]+/).map(x => x.trim().replace(/^<|>$/g, '')).filter(Boolean);
+  const ok = e => /^[^\s@,;<>()"]+@[^\s@,;<>()"]+\.[^\s@,;<>()"]+$/.test(e);
+  return {valid: [...new Set(list.filter(ok))], invalid: list.filter(e => !ok(e))};
+}
+/** Build a parts-due context for one project (or several). */
+function partsContext(projects, assets, mk, inc, single) {
+  const hits = collectParts(projects, assets, mk);
+  const by = b => hits.filter(h => h.bucket === b);
+  const month = by('month'), overdue = by('overdue'), earlier = by('earlier');
+  const ordered = inc ? [...month, ...overdue, ...earlier] : month;
+  return {projects, single: single || null, name: single ? single.name : 'All projects', mk, inc, hits, month, overdue, earlier, ordered,
+    groups: {month: groupHits(month), overdue: groupHits(overdue), earlier: groupHits(earlier)}, totals: partTotals(ordered)};
+}
+const plainLoc = a => [a.building && `Bldg ${a.building}`, a.floor && `Flr ${a.floor}`, a.room, a.areaServed && `serves ${a.areaServed}`].filter(Boolean).join(', ');
+function buildMailto(to, subject, body) {
+  return `mailto:${to.map(e => e.replace(/[%?&#\s]/g, c => encodeURIComponent(c))).join(',')}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+}
+/** Plain-text email: order totals first, then the per-equipment breakdown. Also returns a length-limited mailto body. */
+function partsEmail(ctx, to = []) {
+  const ml = monthLabel(ctx.mk), multi = !ctx.single;
+  const subject = `Filters & belts needed for ${ctx.name} - ${ml}`;
+  const head = [`Filters & belts needed for ${ctx.name} - service month ${ml}.`];
+  if (ctx.single) { const det = [ctx.single.client, ctx.single.address].filter(Boolean).join(', '); if (det) head.push(det); }
+  head.push('', `Please order the following so they are delivered before service in ${ml}.`, '');
+  const extra = ctx.inc && (ctx.overdue.length || ctx.earlier.length);
+  const tot = [`ORDER TOTALS${extra ? ' (includes overdue / earlier items)' : ''}:`];
+  ctx.totals.forEach(t => tot.push(`- ${t.qty} x ${t.size || '(size not set)'} (${t.kind === 'Other' ? 'part' : t.kind.toLowerCase()})`));
+  if (!ctx.totals.length) tot.push('- Nothing due');
+  const block = (g, label) => {
+    const a = g.asset, loc = plainLoc(a);
+    const lines = [`${multi ? g.project.name + ' / ' : ''}${a.tag}${a.type ? ' (' + a.type + ')' : ''}${loc ? ' - ' + loc : ''}`];
+    g.items.forEach(h => lines.push(`  - ${h.part.kind}: ${h.part.size || '(size not set)'} x ${h.part.qty} - ${label === 'overdue' ? 'OVERDUE, was due' : 'due'} ${fmtDate(h.due)} (${freqLabel(h.part.freq).toLowerCase()})${h.part.notes ? ' - ' + h.part.notes : ''}`));
+    return lines;
+  };
+  const sections = [{title: `DUE IN ${ml.toUpperCase()}:`, groups: ctx.groups.month, label: 'month'}];
+  if (ctx.inc && ctx.groups.overdue.length) sections.push({title: 'OVERDUE:', groups: ctx.groups.overdue, label: 'overdue'});
+  if (ctx.inc && ctx.groups.earlier.length) sections.push({title: `ALSO DUE BEFORE ${monthShort(ctx.mk).toUpperCase()}:`, groups: ctx.groups.earlier, label: 'earlier'});
+  const nAssets = new Set(ctx.ordered.map(h => h.asset.id)).size;
+  const foot = ['', `${ctx.ordered.length} line item${ctx.ordered.length === 1 ? '' : 's'} on ${nAssets} piece${nAssets === 1 ? '' : 's'} of equipment.`];
+  const full = [...head, ...tot, '', 'BY EQUIPMENT'];
+  sections.forEach(s => { if (!s.groups.length) return; full.push('', s.title); s.groups.forEach(g => full.push(...block(g, s.label))); });
+  full.push(...foot);
+  const text = full.join('\n');
+  // Mail body: same order, but stop adding equipment blocks when the mailto URL would get too long.
+  const fits = lines => buildMailto(to, subject, lines.join('\r\n')).length <= MAILTO_MAX;
+  const reserve = ['', 'x'.repeat(300)];
+  let mail = [...head], truncated = false, omitted = 0;
+  for (const l of tot) { if (fits([...mail, l, ...reserve])) mail.push(l); else { truncated = true; break; } }
+  if (!truncated) {
+    mail.push('', 'BY EQUIPMENT');
+    for (const s of sections) {
+      let titled = false;
+      for (const g of s.groups) {
+        if (truncated) { omitted++; continue; }
+        const add = [...(titled ? [] : ['', s.title]), ...block(g, s.label)];
+        if (fits([...mail, ...add, ...reserve])) { mail.push(...add); titled = true; } else { truncated = true; omitted++; }
+      }
+    }
+  }
+  if (truncated) mail.push('', omitted ? `...plus ${omitted} more piece${omitted === 1 ? '' : 's'} of equipment not listed here to keep this email short. Full breakdown: see the Excel list (attached or sent separately).`
+    : 'List too long for one email. The full list is in the attached Excel file.');
+  else mail.push(...foot);
+  const body = mail.join('\r\n');
+  return {subject, text, body, truncated, omitted, mailto: buildMailto(to, subject, body)};
+}
+const PART_LIST_HEADERS = ['Project', 'Asset Tag', 'Equipment Type', 'Building', 'Floor', 'Room / Location', 'Area Served', 'Part Type', 'Size / Part #', 'Qty', 'Frequency', 'Frequency (months)', 'Last Replaced', 'Next Due', 'Due Status', 'Part Notes'];
+function partRow(project, a, p, due, statusLabel) {
+  return {'Project': project ? project.name : '', 'Asset Tag': a.tag || '', 'Equipment Type': a.type || '', 'Building': a.building || '', 'Floor': a.floor || '',
+    'Room / Location': a.room || '', 'Area Served': a.areaServed || '', 'Part Type': p.kind, 'Size / Part #': p.size, 'Qty': p.qty,
+    'Frequency': freqLabel(p.freq), 'Frequency (months)': p.freq, 'Last Replaced': p.lastReplaced || '', 'Next Due': due != null ? due : partNextDue(p),
+    'Due Status': statusLabel != null ? statusLabel : partStatus(p).label, 'Part Notes': p.notes || ''};
+}
+const autoCols = (headers, rows) => headers.map(h => ({wch: Math.min(45, Math.max(String(h).length + 2, ...rows.map(r => String(r[h] ?? '').length + 1)))}));
+async function buildPartsXlsx(ctx) {
+  await loadXLSX();
+  const ml = monthLabel(ctx.mk);
+  const tHead = ['Part Type', 'Size / Part #', 'Total Qty', 'Equipment'];
+  const aoa = [['Filters & belts needed', ctx.name], ['Service month', ml], ['Generated', new Date().toLocaleString()],
+    ['Includes overdue / earlier items', ctx.inc ? 'Yes' : 'No'], [], tHead,
+    ...ctx.totals.map(t => [t.kind, t.size, t.qty, t.tags.join(', ')])];
+  const ws1 = XLSX.utils.aoa_to_sheet(aoa); ws1['!cols'] = [{wch: 30}, {wch: 28}, {wch: 10}, {wch: 50}];
+  const bucketLabel = {month: `Due ${ml}`, overdue: 'Overdue', earlier: `Due before ${monthShort(ctx.mk)}`};
+  const rows = [];
+  ['month', 'overdue', 'earlier'].forEach(b => { if (b !== 'month' && !ctx.inc) return; ctx.groups[b].forEach(g => g.items.forEach(h => rows.push(partRow(g.project, g.asset, h.part, h.due, bucketLabel[b])))); });
+  const hdr = PART_LIST_HEADERS.map(h => h === 'Next Due' ? 'Due Date' : h);
+  const rows2 = rows.map(r => { const o = {...r, 'Due Date': r['Next Due']}; delete o['Next Due']; return o; });
+  const ws2 = XLSX.utils.json_to_sheet(rows2, {header: hdr}); ws2['!cols'] = autoCols(hdr, rows2);
+  if (rows2.length) ws2['!autofilter'] = {ref: XLSX.utils.encode_range({s: {r: 0, c: 0}, e: {r: rows2.length, c: hdr.length - 1}})};
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws1, 'Order totals'); XLSX.utils.book_append_sheet(wb, ws2, 'By equipment');
+  wb.Props = {Title: `Filters & belts – ${ctx.name} – ${ml}`, Author: 'Asset Tagger'};
+  const out = XLSX.write(wb, {bookType: 'xlsx', type: 'array', compression: true});
+  return {blob: new Blob([out], {type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}), name: `${slug(ctx.name)}_filters-belts_${ctx.mk}.xlsx`};
+}
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch (e) {}
+  try { const ta = document.createElement('textarea'); ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0'; document.body.appendChild(ta); ta.select(); const ok = document.execCommand('copy'); ta.remove(); return ok; } catch (e) { return false; }
+}
+async function markPartReplaced(aid, partId) {
+  const a = await Data.asset(aid); if (!a) return null;
+  const parts = assetParts(a); const p = parts.find(x => x.id === partId); if (!p) return null;
+  p.lastReplaced = today(); p.dueManual = '';
+  a.parts = parts; await Data.saveAsset(a);
+  return {asset: a, part: p, next: partNextDue(p)};
+}
+/** Home / project reminder: items due next month (and overdue) per project. */
+function partsReminders(projects, assets) {
+  const mk = nextMonthKey(), out = [];
+  projects.forEach(p => {
+    const hits = collectParts([p], assets.filter(a => a.projectId === p.id), mk);
+    const month = hits.filter(h => h.bucket === 'month'), overdue = hits.filter(h => h.bucket === 'overdue');
+    if (month.length || overdue.length) out.push({project: p, mk, month, overdue, emailed: (p.partsEmailed || {})[mk]});
+  });
+  return out;
+}
+function reminderHtml(r) {
+  const p = r.project, ml = monthShort(r.mk);
+  return `<a class="notice due-banner ${r.emailed ? 'done' : ''}" href="#/p/${encodeURIComponent(p.id)}/parts?m=${r.mk}">
+    <div class="db-ico">🔧</div><div class="db-main">
+    ${r.month.length ? `<div><b>Parts due next month (${esc(ml)}) for ${esc(p.name)}:</b> ${r.month.length} item${r.month.length === 1 ? '' : 's'}${kindSummary(r.month) ? ` <span class="muted">(qty ${esc(kindSummary(r.month))})</span>` : ''}</div>`
+      : `<div><b>${esc(p.name)}:</b> filters / belts overdue</div>`}
+    ${r.overdue.length ? `<div class="db-over">${r.overdue.length} overdue</div>` : ''}
+    <div class="db-cta">${r.emailed ? `✓ List emailed ${esc(fmtDate(r.emailed))} · review` : 'Review &amp; email list'} ›</div></div></a>`;
+}
+function partsPill(a) {
+  const st = assetParts(a).map(p => partStatus(p).key);
+  if (st.includes('overdue')) return '<span class="pill pt-pill pt-over">Parts overdue</span>';
+  if (st.includes('this') || st.includes('next')) return '<span class="pill pt-pill pt-next">Parts due soon</span>';
+  return '';
+}
+
+/* ---------------- Service / parts due screen ---------------- */
+async function renderParts(pid, q) {
+  let projects, single = null;
+  if (pid) { single = await Data.project(pid); if (!single) return go('/', true); projects = [single]; }
+  else projects = await Data.projects();
+  const assets = pid ? await Data.assets(pid) : await Data.allAssets();
+  const cur = monthKey();
+  const mk = /^\d{4}-(0[1-9]|1[0-2])$/.test(q.get('m') || '') ? q.get('m') : nextMonthKey();
+  const inc = localStorage.getItem('at-parts-inc') !== '0';
+  const baseHash = pid ? `/p/${encodeURIComponent(pid)}/parts` : '/parts';
+  setChrome(single ? `Parts due – ${single.name}` : 'Parts due – all projects', pid ? `/p/${encodeURIComponent(pid)}` : '/');
+  const ctx = partsContext(projects, assets, mk, inc, single);
+  const to = single ? parseEmails(single.partsEmails).valid : [];
+  const mail = partsEmail(ctx, to);
+  const anyParts = assets.some(a => assetParts(a).length);
+  const months = []; for (let i = -3; i <= 12; i++) months.push(shiftMonth(cur, i));
+  if (!months.includes(mk)) months.push(mk); months.sort();
+  const ml = monthLabel(mk);
+  const itemRow = (h, bucket) => {
+    const p = h.part;
+    return `<div class="due-row"><div class="main">
+      <div><b>${esc(p.qty)} × ${esc(p.size || '(size not set)')}</b> <span class="badge">${esc(p.kind)}</span></div>
+      <div class="small ${bucket === 'overdue' ? 'over-txt' : 'muted'}">${bucket === 'overdue' ? 'Overdue – was due' : 'Due'} ${esc(fmtDate(h.due))}${h.projected ? ' (projected)' : ''} · ${esc(freqLabel(p.freq))}</div>
+      ${p.notes ? `<div class="small muted">${esc(p.notes)}</div>` : ''}</div>
+      <button class="btn sm" data-rep="${esc(h.asset.id)}|${esc(p.id)}" title="Mark replaced today">✓ Replaced</button></div>`;
+  };
+  const groupCards = (groups, bucket) => groups.map(g => `<div class="card due-asset ${bucket === 'overdue' ? 'is-over' : ''}">
+    <a class="due-head" href="#/p/${encodeURIComponent(g.project.id)}/a/${encodeURIComponent(g.asset.id)}">
+      <span class="t">${esc(g.asset.tag)}</span><span class="badge">${esc(g.asset.type || '—')}</span><span class="chev">›</span></a>
+    <div class="small muted due-loc">${esc([!single && g.project.name, locLine(g.asset), g.asset.areaServed && 'Serves ' + g.asset.areaServed].filter(Boolean).join(' · ') || 'No location')}</div>
+    ${g.items.map(h => itemRow(h, bucket)).join('')}</div>`).join('');
+  const nMonth = ctx.month.length;
+  view.innerHTML = `
+    <div class="card parts-ctl">
+      <label class="lbl" for="pmMonth">Service month</label>
+      <div class="month-nav"><button class="btn sm" id="pmPrev" aria-label="Previous month">‹</button>
+        <select id="pmMonth">${months.map(m => `<option value="${m}" ${m === mk ? 'selected' : ''}>${esc(monthLabel(m))}${m === cur ? ' (this)' : m === shiftMonth(cur, 1) ? ' (next)' : ''}</option>`).join('')}</select>
+        <button class="btn sm" id="pmNext" aria-label="Next month">›</button></div>
+      <label class="chk"><input type="checkbox" id="pmInc" ${inc ? 'checked' : ''}> Include overdue &amp; earlier items in the order</label>
+    </div>
+    ${!anyParts ? `<div class="empty"><div class="big">🔧</div><p><b>No filters or belts set up yet.</b></p><p>Open an asset → <b>Edit details</b> → <b>Filters &amp; belts</b> to add sizes and replacement frequency.</p></div>` : `
+    <div class="due-summary">
+      <div><span class="n">${nMonth}</span> due in ${esc(ml)}</div>
+      ${ctx.overdue.length ? `<div class="over-txt"><span class="n">${ctx.overdue.length}</span> overdue</div>` : ''}
+      ${ctx.earlier.length ? `<div><span class="n">${ctx.earlier.length}</span> due before ${esc(monthShort(mk))}</div>` : ''}
+    </div>
+    <div class="card"><div class="lbl">Order totals – ${esc(ml)}${ctx.inc && (ctx.overdue.length || ctx.earlier.length) ? ' (incl. overdue / earlier)' : ''}</div>
+      ${ctx.totals.length ? `<ul class="totals">${ctx.totals.map(t => `<li><span class="q">${esc(t.qty)}×</span><span class="s">${esc(t.size || '(size not set)')}</span><span class="badge">${esc(t.kind)}</span></li>`).join('')}</ul>`
+        : `<p class="muted small" style="margin:4px 0">Nothing to order for ${esc(ml)}.</p>`}
+    </div>
+    <div class="card no-print"><div class="lbl">Send to customer / contractor</div>
+      ${single ? (to.length ? `<p class="small" style="margin:2px 0 8px">To: <b>${esc(to.join(', '))}</b> <button class="linkbtn" id="pmEditEmails">Edit</button></p>`
+        : `<div class="notice warn" style="margin:4px 0 10px">No parts order email set for this project. <button class="linkbtn" id="pmEditEmails">Add email(s)</button></div>`)
+        : `<p class="small muted" style="margin:2px 0 8px">Combined list for all projects – recipients are left blank. Open a project's list to email its customer directly.</p>`}
+      ${mail.truncated ? `<div class="notice warn" style="margin:4px 0 10px">Long list: the email includes the order totals${mail.omitted ? ` and part of the breakdown (${mail.omitted} equipment not listed)` : ''}. Use <b>Download Excel</b> and attach it for the full list.</div>` : ''}
+      <div class="row" style="margin-bottom:0">
+        ${navigator.share ? '<button class="btn sm" id="pmShare">Share text…</button>' : ''}
+        <button class="btn sm" id="pmCopy">Copy text</button>
+        <button class="btn sm" id="pmXlsx">Download Excel</button>
+        ${canShareFiles() ? '<button class="btn sm" id="pmXlsxShare">Share Excel…</button>' : ''}
+      </div>
+      <p class="muted small" style="margin:8px 0 0">“Email this list” opens your mail app with the list filled in – review and press Send there. Email links can't carry attachments; to send the Excel, use Share Excel… (phone) or download and attach it.</p>
+    </div>
+    ${ctx.overdue.length ? `<h2 class="over-txt">Overdue (${ctx.overdue.length})</h2>${groupCards(ctx.groups.overdue, 'overdue')}` : ''}
+    <h2>Due in ${esc(ml)} (${nMonth})</h2>
+    ${nMonth ? groupCards(ctx.groups.month, 'month') : `<div class="empty" style="padding:16px">No filters or belts due in ${esc(ml)}.</div>`}
+    ${ctx.earlier.length ? `<h2>Due before ${esc(monthShort(mk))} (${ctx.earlier.length})</h2>${groupCards(ctx.groups.earlier, 'earlier')}` : ''}`}`;
+  const canSend = anyParts && ctx.ordered.length;
+  setBottomBar(anyParts ? `<a class="btn primary ${canSend ? '' : 'disabled'}" id="pmEmail" ${canSend ? `href="${esc(mail.mailto)}"` : 'aria-disabled="true"'}>✉️ Email this list</a>` : '');
+  const goMonth = m => go(`${baseHash}?m=${m}`, true);
+  $('#pmMonth').onchange = e => goMonth(e.target.value);
+  $('#pmPrev').onclick = () => goMonth(shiftMonth(mk, -1));
+  $('#pmNext').onclick = () => goMonth(shiftMonth(mk, 1));
+  $('#pmInc').onchange = e => { localStorage.setItem('at-parts-inc', e.target.checked ? '1' : '0'); route(); };
+  if (!anyParts) return;
+  const ee = $('#pmEditEmails'); if (ee) ee.onclick = () => projectDialog(single);
+  const em = $('#pmEmail');
+  if (em) em.onclick = async e => {
+    if (!canSend) { e.preventDefault(); toast(`Nothing due in ${ml}`); return; }
+    if (single) { single.partsEmailed = {...(single.partsEmailed || {}), [mk]: nowISO()}; await DB.put('projects', single); }
+    if (single && !to.length) toast('No recipient set – add the address in your mail app', 3500);
+  };
+  const sh = $('#pmShare'); if (sh) sh.onclick = async () => {
+    try { await navigator.share({title: mail.subject, text: mail.text}); } catch (e) { if (e.name !== 'AbortError') toast('Share failed: ' + e.message); }
+  };
+  $('#pmCopy').onclick = async () => toast(await copyText(mail.subject + '\n\n' + mail.text) ? 'List copied' : 'Copy failed');
+  const xl = async share => {
+    try { const {blob, name} = await buildPartsXlsx(ctx); await shareOrDownload(blob, name, share); toast('Excel ready: ' + name); }
+    catch (e) { console.error(e); toast('Excel failed: ' + e.message); }
+  };
+  $('#pmXlsx').onclick = () => xl(false);
+  const xs = $('#pmXlsxShare'); if (xs) xs.onclick = () => xl(true);
+  view.onclick = async e => {
+    const b = e.target.closest('[data-rep]'); if (!b) return;
+    const [aid, partId] = b.dataset.rep.split('|');
+    const h = ctx.hits.find(x => x.asset.id === aid && x.part.id === partId); if (!h) return;
+    if (!await confirmBox('Mark replaced today?', `${esc(h.part.kind)} <b>${esc(h.part.size)}</b> on ${esc(h.asset.tag)} replaced ${esc(fmtDate(today()))}. Next due becomes <b>${esc(fmtDate(partNextDue({...h.part, lastReplaced: today()})))}</b>.`, 'Mark replaced')) return;
+    const r = await markPartReplaced(aid, partId);
+    if (r) { toast(`${r.asset.tag}: ${r.part.kind} replaced – next due ${fmtDate(r.next)}`, 3000); route(); }
+  };
+}
+
 /* ---------------- router ---------------- */
 const view = $('#view');
 const go = (h, replace) => { if (replace) location.replace('#' + h); else location.hash = h; };
@@ -343,16 +669,18 @@ function setBottomBar(html) {
   if (html) { bottomBar = document.createElement('div'); bottomBar.className = 'bottombar no-print'; bottomBar.innerHTML = html; document.body.appendChild(bottomBar); }
 }
 async function route() {
-  revokeAll(); setBottomBar(''); window.scrollTo(0, 0);
+  revokeAll(); setBottomBar(''); window.scrollTo(0, 0); view.onclick = null;
   const {parts, q} = parseHash();
   try {
     if (!parts.length) return await renderHome();
     if (parts[0] === 'settings') return await renderSettings();
+    if (parts[0] === 'parts') return await renderParts(null, q);
     if (parts[0] === 'find') return await handleScan(q.get('tag') || '', q.get('p'), true);
     if (parts[0] === 'p' && parts[1]) {
       const pid = parts[1];
       if (parts.length === 2) return await renderProject(pid);
       if (parts[2] === 'labels') return await renderLabels(pid, q);
+      if (parts[2] === 'parts') return await renderParts(pid, q);
       if (parts[2] === 'a' && parts[3] === 'new') return await renderAssetForm(pid, null, q);
       if (parts[2] === 'a' && parts[3] && parts[4] === 'edit') return await renderAssetForm(pid, parts[3], q);
       if (parts[2] === 'a' && parts[3]) return await renderAsset(pid, parts[3]);
@@ -375,6 +703,8 @@ async function renderHome() {
   assets.forEach(a => { const s = stats[a.projectId] || (stats[a.projectId] = {n: 0, cx: 0, issue: 0}); s.n++; if (a.status === 'Commissioned') s.cx++; if (a.status === 'Issue') s.issue++; });
   view.innerHTML = `
     <div class="row"><button class="btn primary" id="newProj">${ICON.plus} New Project</button><button class="btn" id="scanAny">${ICON.scan} Scan tag</button></div>
+    ${partsReminders(projects, assets).map(reminderHtml).join('')}
+    ${assets.some(a => assetParts(a).length) ? `<a class="btn block" id="allParts" href="#/parts" style="margin:4px 0 6px">🔧 Filters &amp; belts due – all projects</a>` : ''}
     ${projects.length ? `<h2>Projects</h2><div class="list">${projects.map(p => {
       const s = stats[p.id] || {n: 0, cx: 0, issue: 0}; const pct = s.n ? Math.round(100 * s.cx / s.n) : 0;
       return `<a class="item" href="#/p/${encodeURIComponent(p.id)}"><div class="main">
@@ -394,12 +724,16 @@ function projectDialog(p) {
     <div class="field"><label>Project / job site name <span class="req">*</span></label><input id="pjName" value="${esc(p.name)}" placeholder="e.g. St. Mary's Hospital – East Wing" autocomplete="off"></div>
     <div class="field"><label>Client / owner</label><input id="pjClient" value="${esc(p.client)}"></div>
     <div class="field"><label>Address</label><input id="pjAddr" value="${esc(p.address)}"></div>
+    <div class="field"><label for="pjEmails">Parts order email(s)</label><input id="pjEmails" type="text" inputmode="email" autocapitalize="off" autocomplete="off" spellcheck="false" value="${esc(p.partsEmails)}" placeholder="customer@example.com, contractor@example.com">
+      <p class="muted small" style="margin:6px 0 0">Customer / contractor who orders filters &amp; belts. Separate several with commas. Used to pre-fill “Email this list”.</p></div>
     <div class="field"><label>Notes</label><textarea id="pjNotes">${esc(p.notes)}</textarea></div>`,
     onOpen: d => $('#pjName', d).focus(),
     actions: [{label: 'Cancel'}, {label: isNew ? 'Create' : 'Save', cls: 'primary', onClick: async d => {
       const name = $('#pjName', d).value.trim();
       if (!name) { toast('Project name is required'); $('#pjName', d).focus(); return false; }
-      const rec = {...p, id: p.id || uid(), name, client: $('#pjClient', d).value.trim(), address: $('#pjAddr', d).value.trim(), notes: $('#pjNotes', d).value.trim(), createdAt: p.createdAt || nowISO()};
+      const em = parseEmails($('#pjEmails', d).value);
+      if (em.invalid.length) { toast(`Check email address: ${em.invalid.join(', ')}`, 3500); $('#pjEmails', d).focus(); return false; }
+      const rec = {...p, id: p.id || uid(), name, client: $('#pjClient', d).value.trim(), address: $('#pjAddr', d).value.trim(), partsEmails: em.valid.join(', '), notes: $('#pjNotes', d).value.trim(), createdAt: p.createdAt || nowISO()};
       await Data.saveProject(rec);
       toast(isNew ? 'Project created' : 'Project saved');
       if (isNew) go(`/p/${encodeURIComponent(rec.id)}`); else route();
@@ -415,7 +749,8 @@ function applyFilter(assets, f) {
   let out = assets.filter(a =>
     (!f.type || a.type === f.type) && (!f.status || (a.status || 'Not started') === f.status) &&
     (!f.building || (a.building || '') === f.building) && (!f.floor || (a.floor || '') === f.floor) &&
-    (!q || ['tag','type','manufacturer','model','serial','capacity','building','floor','room','areaServed','notes'].some(k => String(a[k] || '').toLowerCase().includes(q))));
+    (!q || ['tag','type','manufacturer','model','serial','capacity','building','floor','room','areaServed','notes'].some(k => String(a[k] || '').toLowerCase().includes(q))
+      || assetParts(a).some(pt => pt.size.toLowerCase().includes(q))));
   const sorters = {
     tag: (a, b) => natCmp(a.tag, b.tag),
     type: (a, b) => natCmp(a.type, b.type) || natCmp(a.tag, b.tag),
@@ -435,6 +770,7 @@ async function renderProject(pid) {
   setChrome(p.name, '/', `<button class="icon-btn" id="pMenu" aria-label="Project menu">${ICON.more}</button>`);
   const anyAdv = f.type || f.building || f.floor || f.sort !== 'tag';
   view.innerHTML = `
+    ${partsReminders([p], assets).map(reminderHtml).join('')}
     <div class="chips" id="statusChips"></div>
     <div class="search"><span>${ICON.search}</span><input id="q" type="search" placeholder="Search tag, model, serial, room…" value="${esc(f.q)}" autocomplete="off" enterkeyhint="search"></div>
     <details class="filters" ${anyAdv ? 'open' : ''}><summary>Filters &amp; sort</summary>
@@ -446,7 +782,7 @@ async function renderProject(pid) {
       </div></details>
     <div class="resultbar"><span id="count"></span><button class="linkbtn" id="clearF">Clear filters</button></div>
     <div class="list" id="assetList"></div>
-    <div class="row no-print"><button class="btn sm" id="bExport">Export</button><button class="btn sm" id="bImport">Import</button><button class="btn sm" id="bLabels">${ICON.print} Labels</button></div>`;
+    <div class="row no-print"><button class="btn sm" id="bExport">Export</button><button class="btn sm" id="bImport">Import</button><button class="btn sm" id="bLabels">${ICON.print} Labels</button><button class="btn sm" id="bParts">🔧 Parts due</button></div>`;
   setBottomBar(`<button class="btn" id="bScan">${ICON.scan} Scan</button><button class="btn primary" id="bAdd">${ICON.plus} Add asset</button>`);
 
   const renderList = () => {
@@ -464,7 +800,7 @@ async function renderProject(pid) {
           <div class="t">${esc(a.tag)}</div>
           <div class="sub">${esc([a.manufacturer, a.model, a.capacity].filter(Boolean).join(' · ') || '—')}</div>
           <div class="sub">${esc(locLine(a) || a.areaServed || '')}${pc[a.id] ? ` · 📷 ${pc[a.id]}` : ''}</div></div>
-          <div class="right"><span class="badge">${esc(a.type || '—')}</span>${statusPill(a.status)}${lifePill(a)}</div></a>`).join('');
+          <div class="right"><span class="badge">${esc(a.type || '—')}</span>${statusPill(a.status)}${lifePill(a)}${partsPill(a)}</div></a>`).join('');
   };
   renderList();
   $('#statusChips').onclick = e => { const c = e.target.closest('.chip'); if (c) { f.status = c.dataset.s; renderList(); } };
@@ -479,12 +815,14 @@ async function renderProject(pid) {
   $('#bExport').onclick = () => exportDialog(p, assets, applyFilter(assets, f));
   $('#bImport').onclick = () => importDialog(p, assets);
   $('#bLabels').onclick = () => go(`/p/${encodeURIComponent(pid)}/labels?filtered=1`);
+  $('#bParts').onclick = () => go(`/p/${encodeURIComponent(pid)}/parts`);
   $('#pMenu').onclick = () => {
     const m = modal({title: p.name, body: `<div class="menu">
       <button class="btn" data-m="edit">✏️ Edit project details</button>
       <button class="btn" data-m="export">⬇️ Export to Excel / CSV</button>
       <button class="btn" data-m="import">⬆️ Import from Excel / CSV</button>
       <button class="btn" data-m="labels">🖨️ Print QR tag labels</button>
+      <button class="btn" data-m="parts">🔧 Filters &amp; belts due / email list</button>
       <button class="btn danger" data-m="delete">🗑️ Delete project</button></div>`});
     m.el.addEventListener('click', async e => {
       const b = e.target.closest('[data-m]'); if (!b) return; m.close();
@@ -493,6 +831,7 @@ async function renderProject(pid) {
       if (a === 'export') exportDialog(p, assets, applyFilter(assets, f));
       if (a === 'import') importDialog(p, assets);
       if (a === 'labels') go(`/p/${encodeURIComponent(pid)}/labels?filtered=1`);
+      if (a === 'parts') go(`/p/${encodeURIComponent(pid)}/parts`);
       if (a === 'delete' && await confirmBox('Delete project?', `This permanently deletes <b>${esc(p.name)}</b> and all ${assets.length} assets and photos on this device. Export or back up first if you need them.`, 'Delete', true)) {
         await Data.deleteProject(pid); toast('Project deleted'); go('/');
       }
@@ -509,6 +848,16 @@ async function renderAsset(pid, aid) {
   const base = `/p/${encodeURIComponent(pid)}/a/${encodeURIComponent(aid)}`;
   setChrome(a.tag, `/p/${encodeURIComponent(pid)}`, `<button class="icon-btn" id="hdrEdit" aria-label="Edit" style="font-size:16px;font-weight:700">Edit</button>`);
   const rows = FIELDS.filter(fl => !['tag','type','status','notes','installYear','lifeExpectancy','ageOverride'].includes(fl.key) && a[fl.key]).map(fl => `<dt>${esc(fl.label)}</dt><dd>${esc(a[fl.key])}</dd>`).join('');
+  const aParts = assetParts(a);
+  const partsCard = `<div class="card parts-card" id="partsCard"><div class="lbl">Filters &amp; belts</div>
+    ${aParts.length ? aParts.map(pt => { const st = partStatus(pt), nd = partNextDue(pt); return `<div class="part-row"><div class="main">
+      <div><b>${esc(pt.qty)} × ${esc(pt.size || '(size not set)')}</b> <span class="badge">${esc(pt.kind)}</span></div>
+      <div class="small muted">${esc(freqLabel(pt.freq))} · Last replaced ${esc(fmtDate(pt.lastReplaced) || '—')}</div>
+      <div class="small" style="margin-top:4px">Next due <b>${esc(fmtDate(nd) || '—')}</b></div><div style="margin-top:4px"><span class="pill pt-pill ${st.cls}">${esc(st.label)}</span></div>
+      ${pt.notes ? `<div class="small muted">${esc(pt.notes)}</div>` : ''}</div>
+      <button class="btn sm" data-prep="${esc(pt.id)}" title="Mark replaced today">✓ Replaced</button></div>`; }).join('')
+      + `<a class="linkbtn" style="display:inline-flex;align-items:center" href="#/p/${encodeURIComponent(pid)}/parts">Parts due list &amp; email ›</a>`
+    : '<p class="muted small" style="margin:4px 0">None set up. Tap <b>Edit details</b> to add filter sizes or belts and how often they’re replaced.</p>'}</div>`;
   view.innerHTML = `
     <div class="hero"><div style="display:flex;gap:12px;align-items:flex-start">
       <div style="flex:1;min-width:0"><div class="tag">${esc(a.tag)}</div>
@@ -518,6 +867,7 @@ async function renderAsset(pid, aid) {
     <div class="card"><div class="lbl">Status — tap to update</div><div class="status-pick" id="stPick">${STATUSES.map(s =>
       `<button data-s="${esc(s)}" class="${(a.status || 'Not started') === s ? 'on ' + STATUS_CLASS[s] : ''}">${esc(s)}</button>`).join('')}</div></div>
     ${lifeCardHtml(a)}
+    ${partsCard}
     <div class="card">${rows ? `<dl class="kv">${rows}</dl>` : '<span class="muted">No details yet. Tap Edit to add manufacturer, model, serial, location…</span>'}</div>
     ${a.notes ? `<div class="card"><div class="lbl">Notes</div><div style="white-space:pre-wrap">${esc(a.notes)}</div></div>` : ''}
     <div class="card"><div class="lbl">Nameplate photos (${photos.length})</div><div class="photos" id="phGrid">
@@ -549,6 +899,14 @@ async function renderAsset(pid, aid) {
       {label: 'Delete photo', cls: 'danger', onClick: async () => { if (await confirmBox('Delete photo?', 'This cannot be undone.', 'Delete', true)) { await Data.deletePhoto(ph.id); route(); } }},
     ]});
   };
+  $('#partsCard').onclick = async e => {
+    const b = e.target.closest('[data-prep]'); if (!b) return;
+    const pt = aParts.find(x => x.id === b.dataset.prep); if (!pt) return;
+    const nd = partNextDue({...pt, lastReplaced: today()});
+    if (!await confirmBox('Mark replaced today?', `${esc(pt.kind)} <b>${esc(pt.size || '')}</b> on ${esc(a.tag)} replaced ${esc(fmtDate(today()))}. Next due becomes <b>${esc(fmtDate(nd))}</b>.`, 'Mark replaced')) return;
+    const r = await markPartReplaced(aid, pt.id);
+    if (r) { toast(`Next due ${fmtDate(r.next)}`); route(); }
+  };
   $('#bLabel').onclick = () => go(`/p/${encodeURIComponent(pid)}/labels?ids=${encodeURIComponent(aid)}`);
   $('#bDup').onclick = () => go(`/p/${encodeURIComponent(pid)}/a/new?from=${encodeURIComponent(aid)}`);
   $('#bDel').onclick = async () => {
@@ -569,6 +927,7 @@ async function renderAssetForm(pid, aid, q) {
     const from = q.get('from') && await Data.asset(q.get('from'));
     if (from) ['type','manufacturer','model','capacity','building','floor','lifeExpectancy'].forEach(k => a[k] = from[k] || '');
     if (from) a.tag = nextTag(from.tag);
+    if (from) a.parts = assetParts(from).map(pt => ({...pt, id: uid()}));
     if (q.get('tag')) a.tag = normTag(q.get('tag'));
     if (!a.type && a.tag) a.type = guessTypeFromTag(a.tag);
     if (a.type && !a.lifeExpectancy) a.lifeExpectancy = String(defaultLife(a.type));
@@ -613,6 +972,13 @@ async function renderAssetForm(pid, aid, q) {
         </details>
         <p class="muted small" style="margin:8px 0 0">Life expectancy prefills from equipment type (ASHRAE mid-range). Age and remaining life update automatically.</p>
       </div>
+      <div class="card parts-ed-card" style="padding:12px;margin:0 0 14px">
+        <div class="lbl">Filters &amp; belts</div>
+        <p class="muted small" style="margin:0 0 10px">Add each filter size or belt this unit needs and how often it's replaced. Items show on the <b>Parts due</b> list (and home-screen reminder) the month before they're due.</p>
+        <div id="partsList"></div>
+        <div class="row" style="margin:4px 0 0"><button type="button" class="btn sm" data-add-part="Filter">+ Filter</button><button type="button" class="btn sm" data-add-part="Belt">+ Belt</button><button type="button" class="btn sm" data-add-part="Other">+ Other</button></div>
+      </div>
+      <datalist id="dl_psize">${[...new Set(assets.flatMap(x => assetParts(x).map(pt => pt.size)).filter(Boolean))].sort(natCmp).map(v => `<option value="${esc(v)}">`).join('')}</datalist>
       <div class="field"><label for="f_notes">Notes</label><textarea id="f_notes" name="notes" placeholder="Deficiencies, observations, startup notes…">${esc(a.notes)}</textarea></div>
       <div class="field"><span class="lbl">Nameplate photos</span><div class="photos" id="phGrid"></div></div>
       ${dl('dl_mfr', 'manufacturer')}${dl('dl_bldg', 'building')}${dl('dl_floor', 'floor')}${dl('dl_room', 'room')}${dl('dl_area', 'areaServed')}
@@ -628,6 +994,49 @@ async function renderAssetForm(pid, aid, q) {
     $('#phInput').onchange = async e => { for (const f of e.target.files) staged.push(await resizeImage(f)); dirty = true; renderPhotos(); };
   };
   renderPhotos();
+  /* Filters & belts editor */
+  const parts = assetParts(a).map(pt => ({...pt, _custom: !FREQS.some(f => f[0] === pt.freq)}));
+  const dueCell = (pt, i) => pt.lastReplaced
+    ? `<label>Next due</label><div class="due-auto"><b>${esc(fmtDate(partNextDue(pt)))}</b> <span class="muted small">auto</span></div>`
+    : `<label for="pd_${i}">Next due <span class="muted small">(set if no last date)</span></label><input id="pd_${i}" type="date" data-k="dueManual" value="${esc(pt.dueManual)}">`;
+  const partEditor = (pt, i) => `<div class="part-ed" data-i="${i}">
+    <div class="part-ed-top">
+      <select data-k="kind" aria-label="Part type">${PART_KINDS.map(k => `<option ${pt.kind === k ? 'selected' : ''}>${k}</option>`).join('')}</select>
+      <label class="qty">Qty <input data-k="qty" type="number" inputmode="numeric" min="1" max="9999" step="1" value="${esc(pt.qty)}"></label>
+      <button type="button" class="icon-btn part-rm" data-rm-part="${i}" aria-label="Remove item">${ICON.close}</button></div>
+    <div class="field"><label>Size / part #</label><input data-k="size" list="dl_psize" value="${esc(pt.size)}" placeholder="${pt.kind === 'Belt' ? 'e.g. A42, BX55' : pt.kind === 'Filter' ? 'e.g. 20x25x2 MERV 13' : 'Part number / description'}" spellcheck="false" autocapitalize="characters"></div>
+    <div class="grid2">
+      <div class="field"><label>Replace every</label><select data-k="freqSel">${FREQS.map(([m, l]) => `<option value="${m}" ${!pt._custom && pt.freq === m ? 'selected' : ''}>${l}</option>`).join('')}<option value="custom" ${pt._custom ? 'selected' : ''}>Custom (months)…</option></select></div>
+      <div class="field" ${pt._custom ? '' : 'hidden'}><label>Every N months</label><input data-k="freqCustom" type="number" inputmode="numeric" min="1" max="120" step="1" value="${esc(pt.freq)}"></div>
+    </div>
+    <div class="grid2">
+      <div class="field"><label>Last replaced</label><input type="date" data-k="lastReplaced" value="${esc(pt.lastReplaced)}"></div>
+      <div class="field" data-due>${dueCell(pt, i)}</div>
+    </div>
+    <div class="row" style="margin:0 0 10px"><button type="button" class="btn sm" data-rep-part="${i}">✓ Mark replaced today</button></div>
+    <div class="field" style="margin:0"><label>Notes</label><input data-k="notes" value="${esc(pt.notes)}" placeholder="e.g. 4 in bank, pleated"></div>
+  </div>`;
+  const pl = $('#partsList');
+  const renderPartsEd = () => { pl.innerHTML = parts.length ? parts.map(partEditor).join('') : '<p class="muted small" style="margin:0 0 6px">No filters or belts yet.</p>'; };
+  const refreshEd = i => { const el = $(`.part-ed[data-i="${i}"]`, pl); if (el) el.outerHTML = partEditor(parts[i], i); };
+  renderPartsEd();
+  const onPartInput = e => {
+    const el = e.target.closest('[data-k]'), ed = e.target.closest('.part-ed'); if (!el || !ed) return;
+    const i = +ed.dataset.i, pt = parts[i], k = el.dataset.k, v = el.value; dirty = true;
+    if (k === 'kind') { const was = pt.kind; pt.kind = v; if (!pt._custom && pt.freq === DEFAULT_FREQ[was]) pt.freq = DEFAULT_FREQ[v]; if (e.type === 'change') refreshEd(i); }
+    else if (k === 'freqSel') { if (v === 'custom') pt._custom = true; else { pt._custom = false; pt.freq = +v; } if (e.type === 'change') refreshEd(i); }
+    else if (k === 'freqCustom') { const n = Math.round(+v); if (n >= 1 && n <= 120) pt.freq = n; $('[data-due]', ed).innerHTML = dueCell(pt, i); }
+    else if (k === 'lastReplaced') { if (pt.lastReplaced !== v) { pt.lastReplaced = v; $('[data-due]', ed).innerHTML = dueCell(pt, i); } }
+    else pt[k] = v;
+  };
+  pl.addEventListener('input', onPartInput); pl.addEventListener('change', onPartInput);
+  form.addEventListener('click', e => {
+    const add = e.target.closest('[data-add-part]');
+    if (add) { parts.push({...normPart({kind: add.dataset.addPart}), _custom: false}); dirty = true; renderPartsEd(); const f = $(`.part-ed[data-i="${parts.length - 1}"] [data-k="size"]`, pl); if (f) f.focus(); return; }
+    const rm = e.target.closest('[data-rm-part]'); if (rm) { parts.splice(+rm.dataset.rmPart, 1); dirty = true; renderPartsEd(); return; }
+    const rp = e.target.closest('[data-rep-part]');
+    if (rp) { const i = +rp.dataset.repPart; parts[i].lastReplaced = today(); parts[i].dueManual = ''; dirty = true; refreshEd(i); toast(`Replaced today – next due ${fmtDate(partNextDue(parts[i]))}`); }
+  });
   $('#phGrid').onclick = e => {
     const r = e.target.closest('[data-rm]'); if (r) { removed.add(r.dataset.rm); dirty = true; renderPhotos(); }
     const s = e.target.closest('[data-rms]'); if (s) { staged.splice(+s.dataset.rms, 1); renderPhotos(); }
@@ -708,6 +1117,7 @@ async function renderAssetForm(pid, aid, q) {
         go(`/p/${encodeURIComponent(pid)}/a/${encodeURIComponent(dup.id)}`);
       return;
     }
+    rec.parts = parts.map(({_custom, ...pt}) => normPart(pt)).filter(pt => pt.size || pt.lastReplaced || pt.dueManual || pt.notes);
     rec.id = a.id || uid(); rec.projectId = pid; rec.createdAt = a.createdAt || nowISO();
     await Data.saveAsset(rec);
     for (const id of removed) await Data.deletePhoto(id);
@@ -848,7 +1258,8 @@ async function renderLabels(pid, q) {
 
 /* ---------------- Export / import ---------------- */
 const EXPORT_FIELDS = FIELDS.filter(f => f.export !== false);
-const HEADERS = ['Project', ...EXPORT_FIELDS.map(f => f.label), 'Age', 'Remaining Life', 'Photos', 'Created', 'Last Updated'];
+const HEADERS = ['Project', ...EXPORT_FIELDS.map(f => f.label), 'Age', 'Remaining Life', 'Filters & Belts', 'Photos', 'Created', 'Last Updated'];
+const partsSummary = a => assetParts(a).map(pt => `${pt.qty}x ${pt.kind} ${pt.size || '(size not set)'} (${freqLabel(pt.freq).toLowerCase()}, next due ${partNextDue(pt) || 'not set'})`).join('; ');
 function assetRows(project, assets, pc) {
   return assets.slice().sort((a, b) => natCmp(a.tag, b.tag)).map(a => {
     const r = {'Project': project.name};
@@ -856,6 +1267,7 @@ function assetRows(project, assets, pc) {
     const age = computeAge(a), rem = computeRemaining(a);
     r['Age'] = age != null ? age : '';
     r['Remaining Life'] = rem != null ? rem : '';
+    r['Filters & Belts'] = partsSummary(a);
     r['Photos'] = pc[a.id] || 0;
     r['Created'] = a.createdAt ? new Date(a.createdAt).toLocaleString() : '';
     r['Last Updated'] = a.updatedAt ? new Date(a.updatedAt).toLocaleString() : '';
@@ -870,16 +1282,27 @@ async function buildExport(project, assets, fmt) {
   ws['!cols'] = HEADERS.map(h => ({wch: Math.min(45, Math.max(h.length + 2, ...rows.map(r => String(r[h] ?? '').length + 1)))}));
   if (rows.length) ws['!autofilter'] = {ref: XLSX.utils.encode_range({s: {r: 0, c: 0}, e: {r: rows.length, c: HEADERS.length - 1}})};
   const name = `${slug(project.name)}_assets_${today()}`;
+  const pRows = [];
+  assets.slice().sort((a, b) => natCmp(a.tag, b.tag)).forEach(a => assetParts(a).forEach(pt => pRows.push(partRow(project, a, pt))));
+  const wsP = XLSX.utils.json_to_sheet(pRows, {header: PART_LIST_HEADERS});
+  wsP['!cols'] = autoCols(PART_LIST_HEADERS, pRows);
+  if (pRows.length) wsP['!autofilter'] = {ref: XLSX.utils.encode_range({s: {r: 0, c: 0}, e: {r: pRows.length, c: PART_LIST_HEADERS.length - 1}})};
+  if (fmt === 'parts-csv') {
+    const csv = XLSX.utils.sheet_to_csv(wsP);
+    return {blob: new Blob(['\ufeff' + csv], {type: 'text/csv;charset=utf-8'}), name: `${slug(project.name)}_filters-belts_${today()}.csv`};
+  }
   if (fmt === 'csv') {
     const csv = XLSX.utils.sheet_to_csv(ws);
     return {blob: new Blob(['\ufeff' + csv], {type: 'text/csv;charset=utf-8'}), name: name + '.csv'};
   }
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Assets');
+  XLSX.utils.book_append_sheet(wb, wsP, 'Parts');
   const sum = [['Project', project.name], ['Client / owner', project.client || ''], ['Address', project.address || ''], ['Exported', new Date().toLocaleString()], ['Total assets', assets.length], [], ['Status', 'Count']];
   STATUSES.forEach(s => sum.push([s, assets.filter(a => (a.status || 'Not started') === s).length]));
   sum.push([], ['Equipment type', 'Count']);
   TYPES.forEach(t => { const n = assets.filter(a => a.type === t).length; if (n) sum.push([t, n]); });
+  sum.push([], ['Filter / belt line items', pRows.length], ['Overdue', pRows.filter(r => r['Due Status'] === 'Overdue').length], ['Due next month', pRows.filter(r => r['Due Status'] === 'Due next month').length]);
   const ws2 = XLSX.utils.aoa_to_sheet(sum); ws2['!cols'] = [{wch: 22}, {wch: 40}];
   XLSX.utils.book_append_sheet(wb, ws2, 'Summary');
   wb.Props = {Title: `${project.name} – Asset register`, Author: 'Asset Tagger'};
@@ -891,7 +1314,7 @@ function exportDialog(project, all, filtered) {
   const hasFilter = filtered.length !== all.length;
   modal({title: 'Export assets', body: `
     ${hasFilter ? `<div class="field"><label>Which assets?</label><select id="exScope"><option value="all">All assets (${all.length})</option><option value="filtered">Current filtered list (${filtered.length})</option></select></div>` : `<p>${all.length} asset${all.length === 1 ? '' : 's'} in <b>${esc(project.name)}</b>.</p>`}
-    <div class="field"><label>Format</label><select id="exFmt"><option value="xlsx">Excel (.xlsx)</option><option value="csv">CSV (.csv)</option></select></div>
+    <div class="field"><label>Format</label><select id="exFmt"><option value="xlsx">Excel (.xlsx) – Assets + Parts sheets</option><option value="csv">CSV (.csv) – assets</option><option value="parts-csv">CSV (.csv) – filters &amp; belts list</option></select></div>
     <p class="muted small">Photos aren't included in spreadsheets (a photo count is). Use Settings → Backup to keep photos.</p>`,
     actions: [
       ...(share ? [{label: 'Share…', onClick: d => doExport(d, true)}] : []),
@@ -921,14 +1344,77 @@ async function parseImportFile(file) {
   const wb = /\.csv$/i.test(file.name) || file.type === 'text/csv'
     ? XLSX.read(new TextDecoder().decode(buf), {type: 'string', raw: true})
     : XLSX.read(buf, {type: 'array', cellDates: true});
-  const sheetName = wb.SheetNames.find(n => /asset|equip|schedule/i.test(n)) || wb.SheetNames[0];
-  return XLSX.utils.sheet_to_json(wb.Sheets[sheetName], {defval: '', raw: true});
+  const toRows = n => XLSX.utils.sheet_to_json(wb.Sheets[n], {defval: '', raw: true});
+  const partsName = wb.SheetNames.find(n => /^(parts|filters|belts|maintenance parts)\b/i.test(n.trim()));
+  const skip = n => n === partsName || /^(summary|order totals|by equipment)$/i.test(n.trim());
+  const assetName = wb.SheetNames.find(n => !skip(n) && /asset|equip|schedule/i.test(n)) || wb.SheetNames.find(n => !skip(n));
+  let rows = assetName ? toRows(assetName) : [], parts = partsName ? toRows(partsName) : [];
+  if (!partsName && rows.length && isPartsHeaders(Object.keys(rows[0]))) { parts = rows; rows = []; } // a parts-only list (e.g. Parts CSV)
+  return {rows, parts};
+}
+const PART_IMPORT = {
+  tag: ['asset tag', 'tag', 'asset id', 'equipment tag', 'unit tag', 'equipment id', 'unit', 'mark'],
+  kind: ['part type', 'type', 'part', 'item type', 'kind', 'category', 'item'],
+  size: ['size / part #', 'size/part #', 'size / part number', 'size', 'part #', 'part number', 'part no', 'filter size', 'belt size', 'description'],
+  qty: ['qty', 'quantity', 'count'],
+  freqMonths: ['frequency (months)', 'frequency months', 'months', 'interval (months)'],
+  freqText: ['frequency', 'replacement frequency', 'interval', 'replace every'],
+  lastReplaced: ['last replaced', 'last changed', 'last replaced date', 'replaced', 'last change'],
+  nextDue: ['next due', 'next due date', 'due date', 'due'],
+  notes: ['part notes', 'notes', 'note', 'comments'],
+};
+function mapPartHeaders(headers) {
+  const m = {};
+  Object.entries(PART_IMPORT).forEach(([k, al]) => { for (const x of al) { const h = headers.find(h => normKey(h) === normKey(x) && !Object.values(m).includes(h)); if (h) { m[k] = h; break; } } });
+  return m;
+}
+const isPartsHeaders = headers => headers.map(normKey).some(k => ['part type', normKey('Size / Part #'), 'part #', 'part number'].includes(k));
+function parseFreq(v) {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') return v > 0 ? Math.round(v) : null;
+  const s = String(v).toLowerCase().trim(); let m;
+  if ((m = s.match(/(\d+)\s*(y|yr|yrs|year|years)\b/))) return +m[1] * 12;
+  const f = FREQS.find(([, l]) => l.toLowerCase() === s); if (f) return f[0];
+  if (/semi|twice a year|bi-?annual/.test(s)) return 6;
+  if (/quarter/.test(s)) return 3;
+  if (/bi-?month/.test(s)) return 2;
+  if ((m = s.match(/(\d+)\s*(m|mo|mos|month|months)?\b/))) return +m[1];
+  if (/annual|year/.test(s)) return 12;
+  if (/month/.test(s)) return 1;
+  return null;
+}
+/** Parts sheet rows → asset.parts. Each asset listed gets its filter/belt list replaced by the sheet's rows. */
+function applyPartsImport(plan, partRows, existing) {
+  const res = {items: 0, assets: 0, unknown: [], noTag: false, rows: (partRows || []).length};
+  plan.parts = res;
+  if (!partRows || !partRows.length) return res;
+  const hm = mapPartHeaders(Object.keys(partRows[0]));
+  if (!hm.tag) { res.noTag = true; return res; }
+  const byTag = new Map();
+  existing.forEach(a => byTag.set(normTag(a.tag), a));
+  [...plan.update, ...plan.create].forEach(a => byTag.set(normTag(a.tag), a));
+  const grouped = new Map();
+  partRows.forEach(r => { const t = normTag(r[hm.tag]); if (!t) return; if (!grouped.has(t)) grouped.set(t, []); grouped.get(t).push(r); });
+  grouped.forEach((rows, t) => {
+    const a = byTag.get(t); if (!a) { res.unknown.push(t); return; }
+    const g = (r, k) => hm[k] ? r[hm[k]] : '';
+    const list = rows.map(r => {
+      const size = String(g(r, 'size') ?? '').trim();
+      const last = toISODate(g(r, 'lastReplaced')) || '';
+      return normPart({kind: normKind(g(r, 'kind')) || (/^(a|b|c|ax|bx|cx|3l|4l|5l)\d{2,3}$/i.test(size) ? 'Belt' : 'Filter'), size,
+        qty: g(r, 'qty'), freq: parseFreq(g(r, 'freqMonths')) || parseFreq(g(r, 'freqText')), lastReplaced: last,
+        dueManual: last ? '' : (toISODate(g(r, 'nextDue')) || ''), notes: String(g(r, 'notes') ?? '').trim()});
+    }).filter(pt => pt.size || pt.lastReplaced || pt.dueManual);
+    a.parts = list; res.items += list.length; res.assets++;
+    if (!plan.create.includes(a) && !plan.update.includes(a)) plan.update.push(a);
+  });
+  return res;
 }
 function planImport(rows, existing, pid) {
   const headers = rows.length ? Object.keys(rows[0]) : [];
   const hmap = mapHeaders(headers);
   const byTag = new Map(existing.map(a => [normTag(a.tag), a]));
-  const plan = {create: [], update: [], skipped: 0, hmap, unmapped: headers.filter(h => !hmap[h] && !/^(project|photos|created|last updated|remaining life|remaining)$/i.test(h.trim()))};
+  const plan = {create: [], update: [], skipped: 0, hmap, unmapped: headers.filter(h => !hmap[h] && !/^(project|photos|created|last updated|remaining life|remaining|filters & belts)$/i.test(h.trim()))};
   const seen = new Map();
   rows.forEach(row => {
     const rec = {};
@@ -978,7 +1464,7 @@ function planImport(rows, existing, pid) {
 function importDialog(project, existing) {
   modal({title: 'Import assets', body: `
     <p>Import an equipment list from <b>Excel (.xlsx)</b> or <b>CSV</b>. The first row must be column headers, e.g. <i>Tag, Type, Manufacturer, Model, Serial, Building, Floor, Room, Area Served, Status</i>. Column names are matched loosely.</p>
-    <p class="muted small">Rows whose tag already exists in this project update that asset (blank cells don't overwrite). New tags are added.</p>
+    <p class="muted small">Rows whose tag already exists in this project update that asset (blank cells don't overwrite). New tags are added. A <b>Parts</b> sheet (Asset Tag, Part Type, Size / Part #, Qty, Frequency, Last Replaced, Next Due) imports filters &amp; belts and replaces the filter/belt list of each asset it lists.</p>
     <label class="btn primary block">Choose file…<input type="file" id="impFile" hidden accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"></label>
     <div class="row"><button class="btn sm" id="tplBtn">Download blank template</button></div>
     <div id="impResult"></div>`,
@@ -990,18 +1476,26 @@ function importDialog(project, existing) {
         const ws = XLSX.utils.aoa_to_sheet([cols, sample]);
         ws['!cols'] = cols.map(h => ({wch: Math.max(14, h.length + 2)}));
         const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Assets');
+        const pCols = ['Asset Tag', 'Part Type', 'Size / Part #', 'Qty', 'Frequency', 'Last Replaced', 'Next Due', 'Part Notes'];
+        const wsP = XLSX.utils.aoa_to_sheet([pCols, ['AHU-1', 'Filter', '20x25x2 MERV 13', 6, 'Quarterly', today(), '', 'Pre-filter bank'], ['AHU-1', 'Belt', 'BX55', 2, 'Semi-annual', today(), '', '']]);
+        wsP['!cols'] = pCols.map(h => ({wch: Math.max(14, h.length + 2)})); XLSX.utils.book_append_sheet(wb, wsP, 'Parts');
         downloadBlob(new Blob([XLSX.write(wb, {bookType: 'xlsx', type: 'array'})], {type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}), 'asset_import_template.xlsx');
       };
       $('#impFile', d).onchange = async e => {
         const file = e.target.files[0]; if (!file) return;
         const out = $('#impResult', d); out.innerHTML = '<p>Reading…</p>';
         try {
-          const rows = await parseImportFile(file);
-          const plan = planImport(rows, existing.map(a => ({...a})), project.id);
-          if (!Object.values(plan.hmap).includes('tag')) { out.innerHTML = `<div class="notice warn">Couldn't find a Tag / Asset ID column. Found: ${esc(Object.keys(rows[0] || {}).join(', ') || 'no columns')}</div>`; return; }
-          out.innerHTML = `<div class="notice"><b>${rows.length}</b> rows read from ${esc(file.name)}<br>
+          const {rows, parts} = await parseImportFile(file);
+          const ex = existing.map(a => ({...a}));
+          const plan = planImport(rows, ex, project.id);
+          const pr = applyPartsImport(plan, parts, ex);
+          if (!rows.length && !parts.length) { out.innerHTML = '<div class="notice warn">No rows found in that file.</div>'; return; }
+          if (rows.length && !Object.values(plan.hmap).includes('tag')) { out.innerHTML = `<div class="notice warn">Couldn't find a Tag / Asset ID column. Found: ${esc(Object.keys(rows[0] || {}).join(', ') || 'no columns')}</div>`; return; }
+          out.innerHTML = `<div class="notice">${rows.length ? `<b>${rows.length}</b> asset rows` : `<b>${parts.length}</b> filter/belt rows`} read from ${esc(file.name)}<br>
             ➕ <b>${plan.create.length}</b> new assets<br>✏️ <b>${plan.update.length}</b> existing assets updated<br>${plan.skipped ? `⚠️ ${plan.skipped} rows skipped (no tag)<br>` : ''}
-            <span class="small">Columns used: ${esc(Object.entries(plan.hmap).map(([h, k]) => `${h} → ${FIELDS.find(f => f.key === k).label}`).join(', '))}</span>
+            ${pr.rows ? `🔧 <b>${pr.items}</b> filter/belt items for ${pr.assets} asset${pr.assets === 1 ? '' : 's'}<br>` : ''}
+            ${pr.noTag ? '⚠️ Parts sheet has no Asset Tag column – skipped<br>' : ''}${pr.unknown.length ? `⚠️ Parts for unknown tags skipped: ${esc(pr.unknown.slice(0, 10).join(', '))}${pr.unknown.length > 10 ? '…' : ''}<br>` : ''}
+            ${rows.length ? `<span class="small">Columns used: ${esc(Object.entries(plan.hmap).map(([h, k]) => `${h} → ${FIELDS.find(f => f.key === k).label}`).join(', '))}</span>` : ''}
             ${plan.unmapped.length ? `<br><span class="small">Ignored columns: ${esc(plan.unmapped.join(', '))}</span>` : ''}</div>
             <button class="btn primary block" id="impApply" ${plan.create.length + plan.update.length ? '' : 'disabled'}>Import ${plan.create.length + plan.update.length} assets</button>`;
           $('#impApply', d).onclick = async () => {
@@ -1040,7 +1534,7 @@ async function renderSettings() {
   const pb = $('#persistBtn'); if (pb) pb.onclick = async () => { const ok = navigator.storage && navigator.storage.persist ? await navigator.storage.persist() : false; toast(ok ? 'Storage protection on' : 'Browser declined — install to home screen and try again'); route(); };
   const doBackup = async share => {
     toast('Preparing backup…');
-    const out = {app: 'asset-tagger', version: 1, exportedAt: nowISO(), projects, assets, photos: []};
+    const out = {app: 'asset-tagger', version: 1, appVersion: APP_VERSION, exportedAt: nowISO(), projects, assets, photos: []};
     for (const ph of photos) out.photos.push({id: ph.id, assetId: ph.assetId, createdAt: ph.createdAt, type: ph.type, data: await blobToDataURL(ph.blob)});
     await shareOrDownload(new Blob([JSON.stringify(out)], {type: 'application/json'}), `asset-tagger-backup_${today()}.json`, share);
   };
@@ -1066,7 +1560,8 @@ async function renderSettings() {
 /* ---------------- boot ---------------- */
 // html5-qrcode can leave a pending video.play() promise when the camera is stopped quickly; that rejection is harmless.
 window.addEventListener('unhandledrejection', e => { const r = e.reason; if (r && r.name === 'AbortError' && /play\(\)/.test(r.message || '')) e.preventDefault(); });
-window.AssetTagger = {Data, DB, buildExport, planImport, parseImportFile, handleScan, normalizeStatus, normalizeType, guessTypeFromTag, nextTag, extractTag, computeAge, computeRemaining, defaultLife, LIFE_DEFAULTS, version: APP_VERSION};
+window.AssetTagger = {Data, DB, buildExport, planImport, parseImportFile, handleScan, normalizeStatus, normalizeType, guessTypeFromTag, nextTag, extractTag, computeAge, computeRemaining, defaultLife, LIFE_DEFAULTS,
+  addMonths, normPart, partNextDue, partStatus, partHits, collectParts, partTotals, partsContext, partsEmail, parseEmails, parseFreq, applyPartsImport, buildPartsXlsx, version: APP_VERSION};
 if ('serviceWorker' in navigator && window.isSecureContext && location.protocol !== 'file:') {
   window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js', {scope: './'}).catch(e => console.warn('SW registration failed', e)));
 }

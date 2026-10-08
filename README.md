@@ -1,4 +1,4 @@
-# Asset Tagger (v1.1.0)
+# Asset Tagger (v1.2.0)
 
 Offline-first, mobile-first web app for tagging HVAC / mechanical equipment on job sites
 (AHUs, RTUs, chillers, boilers, pumps, VAVs, FCUs, exhaust fans, cooling towers, heat exchangers, VRF units…).
@@ -22,10 +22,18 @@ Plain static files. No build step, no server code, no account. All data stays in
   so the phone's normal camera opens the asset in the app (`#/find?tag=…`).
 - **Search and filter** by status (chips with counts), type, building and floor, plus free-text search (tag, model, serial, room, notes…).
   Sort by tag (natural order), type, location, status or recently updated.
-- **Export** to Excel (.xlsx with an Assets sheet plus a Summary sheet of counts by status and type, with auto-filter) or CSV.
+- **Export** to Excel (.xlsx with an Assets sheet, a Parts sheet (one row per filter/belt with next due date) and a Summary sheet of counts by status and type, with auto-filter) or CSV.
   On phones that support it, a Share… button sends the file to email, Teams, Drive and other apps.
 - **Import** an equipment schedule from .xlsx or .csv. Headers are matched loosely (Tag/Mark, Mfr/Make, S/N, Bldg, Level, Serves, Cx Status…).
   A row with an existing tag updates that asset, and blank cells don't overwrite existing values. A blank template is included.
+- **Filters & belts**: each asset can list the filters, belts and other wear parts it takes (size / part #, qty, replacement
+  frequency: monthly, every 2 months, quarterly, every 4 months, semi-annual, annual or custom months), last replaced date and
+  next due date (last replaced + frequency, or entered by hand when the last date is unknown). "Mark replaced today" rolls it forward.
+- **Parts due list** per project (and across all projects): pick a service month (defaults to next month) to see every filter/belt
+  due that month grouped by equipment, overdue items highlighted, plus consolidated **order totals** (e.g. 10 × 20x25x2 MERV 13, 2 × BX55).
+  **Email this list** opens the phone's mail app with the To (project "Parts order email(s)"), subject and a plain-text body
+  (totals first, then per-equipment breakdown) filled in. Also: Share text, Copy, Download Excel, Share Excel (to attach the file).
+  The home screen shows a reminder banner the month before parts are due.
 - **Backup / restore** of all projects, assets and photos as a single .json file.
 - **Installable PWA**: a service worker caches everything, so the app opens and works with no signal after the first visit.
 
@@ -59,6 +67,8 @@ Any static host works. Upload the folder contents as-is.
    (password-protected and deleted after 1 hour unless claimed), so sign in or claim it to keep it.
 
 ## Data notes / limitations
+- "Email this list" uses a `mailto:` link (there is no server), so the app can't send email by itself or attach files:
+  it opens your mail app ready to send. Very long lists are shortened in the email (totals first) – attach the Excel instead.
 - Data lives only in that phone's browser. Clearing site data, uninstalling, or (on iPhone) not using a non-installed
   site for weeks can erase it. Install the app to the home screen, allow "storage protection", and **back up regularly**.
 - There's no multi-user sync between devices yet. Use backup/restore or export/import to move data.
