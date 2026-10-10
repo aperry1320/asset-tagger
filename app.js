@@ -2,7 +2,11 @@
    Vanilla JS, data in IndexedDB. Vendor libs (loaded on demand): html5-qrcode, SheetJS (xlsx); qrcode-generator loaded up front. */
 'use strict';
 (() => {
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.4.0';
+/* Demo mode (?demo=1): separate IndexedDB + storage keys, preloaded sample data. Never touches the real 'asset-tagger' DB. */
+const DEMO = /(?:^|[?&])demo=1(?:&|$)/.test(location.search.slice(1));
+const DB_NAME = DEMO ? 'asset-tagger-demo' : 'asset-tagger';
+const LSK = k => DEMO ? 'demo:' + k : k;
 const TYPES = ['AHU','RTU','Chiller','Boiler','Pump','VAV','FCU','Exhaust Fan','Cooling Tower','Heat Exchanger','VRF Unit','Other'];
 const STATUSES = ['Not started','Installed','Started up','Commissioned','Issue'];
 const STATUS_CLASS = {'Not started':'s-none','Installed':'s-inst','Started up':'s-start','Commissioned':'s-cx','Issue':'s-issue'};
@@ -303,7 +307,7 @@ function revokeAll() { objectURLs.forEach(u => URL.revokeObjectURL(u)); objectUR
 const DB = (() => {
   let dbp;
   const open = () => dbp || (dbp = new Promise((res, rej) => {
-    const r = indexedDB.open('asset-tagger', 1);
+    const r = indexedDB.open(DB_NAME, 1);
     r.onupgradeneeded = () => {
       const db = r.result;
       db.createObjectStore('projects', {keyPath: 'id'});
@@ -611,7 +615,7 @@ async function renderParts(pid, q) {
   const assets = pid ? await Data.assets(pid) : await Data.allAssets();
   const cur = monthKey();
   const mk = /^\d{4}-(0[1-9]|1[0-2])$/.test(q.get('m') || '') ? q.get('m') : nextMonthKey();
-  const inc = localStorage.getItem('at-parts-inc') !== '0';
+  const inc = localStorage.getItem(LSK('at-parts-inc')) !== '0';
   const baseHash = pid ? `/p/${encodeURIComponent(pid)}/parts` : '/parts';
   setChrome(single ? `Parts due – ${single.name}` : 'Parts due – all projects', pid ? `/p/${encodeURIComponent(pid)}` : '/');
   const ctx = partsContext(projects, assets, mk, inc, single);
@@ -676,7 +680,7 @@ async function renderParts(pid, q) {
   $('#pmMonth').onchange = e => goMonth(e.target.value);
   $('#pmPrev').onclick = () => goMonth(shiftMonth(mk, -1));
   $('#pmNext').onclick = () => goMonth(shiftMonth(mk, 1));
-  $('#pmInc').onchange = e => { localStorage.setItem('at-parts-inc', e.target.checked ? '1' : '0'); route(); };
+  $('#pmInc').onchange = e => { localStorage.setItem(LSK('at-parts-inc'), e.target.checked ? '1' : '0'); route(); };
   if (!anyParts) return;
   const ee = $('#pmEditEmails'); if (ee) ee.onclick = () => projectDialog(single);
   const em = $('#pmEmail');
@@ -798,10 +802,10 @@ function projectDialog(p) {
 }
 
 /* ---------------- Project: asset list ---------------- */
-const filterState = JSON.parse(sessionStorage.getItem('at-filters') || '{}');
+const filterState = JSON.parse(sessionStorage.getItem(LSK('at-filters')) || '{}');
 const getFilter = pid => { const f = filterState[pid] || (filterState[pid] = {q: '', type: '', status: '', building: '', floor: '', sort: 'tag'});
   if (f.panel === undefined) f.panel = ''; if (f.fed === undefined) f.fed = ''; return f; };
-const saveFilters = () => sessionStorage.setItem('at-filters', JSON.stringify(filterState));
+const saveFilters = () => sessionStorage.setItem(LSK('at-filters'), JSON.stringify(filterState));
 function applyFilter(assets, f) {
   const q = f.q.trim().toLowerCase();
   let out = assets.filter(a =>
@@ -1453,7 +1457,7 @@ async function renderLabels(pid, q) {
   else assets = q.get('filtered') ? applyFilter(all, getFilter(pid)) : all.slice().sort((a, b) => natCmp(a.tag, b.tag));
   const back = q.get('ids') && assets.length === 1 ? `/p/${encodeURIComponent(pid)}/a/${encodeURIComponent(assets[0].id)}` : `/p/${encodeURIComponent(pid)}`;
   setChrome('Print labels', back);
-  const opt = JSON.parse(localStorage.getItem('at-label-opts') || '{}');
+  const opt = JSON.parse(localStorage.getItem(LSK('at-label-opts')) || '{}');
   const o = {size: 'md', content: 'tag', project: true, location: true, border: true, ...opt};
   const canLink = /^https:/.test(location.protocol);
   if (!canLink && o.content === 'link') o.content = 'tag';
@@ -1473,7 +1477,7 @@ async function renderLabels(pid, q) {
   const appBase = location.href.split('#')[0];
   const draw = () => {
     Object.assign(o, {size: $('#lSize').value, content: $('#lContent').value, project: $('#lProj').checked, location: $('#lLoc').checked, border: $('#lBorder').checked});
-    localStorage.setItem('at-label-opts', JSON.stringify(o));
+    localStorage.setItem(LSK('at-label-opts'), JSON.stringify(o));
     $('#labels').innerHTML = assets.length ? assets.map(a => {
       const data = o.content === 'link' ? `${appBase}#/find?tag=${encodeURIComponent(a.tag)}` : a.tag;
       const loc = [locLine(a), a.areaServed && `Serves: ${a.areaServed}`].filter(Boolean).join(' · ');
@@ -1797,15 +1801,146 @@ async function renderSettings() {
   };
 }
 
+/* ---------------- Demo mode: sample data ---------------- */
+// Dates are built relative to today so "due next month", "overdue" and equipment ages always look right.
+function demoData() {
+  const Y = new Date().getFullYear(), t = today();
+  const dueIn = (offset, freq, day) => { const d = addMonths(t.slice(0, 8) + String(day).padStart(2, '0'), offset); return addMonths(d, -freq); }; // lastReplaced so next due lands `offset` months from now
+  const P1 = 'demo-mob', P2 = 'demo-school';
+  const stamp = (m) => new Date(Date.now() - m * 60000).toISOString();
+  const projects = [
+    {id: P1, name: 'Sample Medical Office Building', client: 'Sample Health Partners (demo)', address: '100 Example Way, Anytown, USA',
+      partsEmails: 'orders@example.com', notes: 'Fictional sample project for the Asset Tagger demo. Makes, models and serial numbers are made up.', createdAt: stamp(9000), updatedAt: stamp(1)},
+    {id: P2, name: 'Sample Elementary School – RTU Replacement', client: 'Sample School District (demo)', address: '200 Demo Street, Anytown, USA',
+      partsEmails: 'facilities@example.com', notes: 'Fictional sample project.', createdAt: stamp(20000), updatedAt: stamp(600)},
+  ];
+  const assets = []; let n = 0;
+  const A = (pid, o) => { n++; assets.push({id: `demo-${pid === P1 ? 'm' : 's'}-${normTag(o.tag).toLowerCase()}`, projectId: pid, type: guessTypeFromTag(o.tag) || 'Other',
+    manufacturer: '', model: '', serial: '', capacity: '', building: '', floor: '', room: '', areaServed: '', fedFrom: '', controlledBy: '', powerPanel: '', breaker: '', voltage: '', disconnect: '',
+    installDate: '', ageOverride: '', status: 'Not started', notes: '', parts: [], createdAt: stamp(8000 - n * 30), updatedAt: stamp(500 - n * 10), ...o,
+    lifeExpectancy: o.lifeExpectancy ?? defaultLife(o.type || guessTypeFromTag(o.tag) || 'Other')}); };
+  const F = (size, qty, freq, offset, day, notes) => normPart({kind: 'Filter', size, qty, freq, lastReplaced: dueIn(offset, freq, day), notes: notes || ''});
+  const B = (size, qty, freq, offset, day, notes) => normPart({kind: 'Belt', size, qty, freq, lastReplaced: dueIn(offset, freq, day), notes: notes || ''});
+  const plant = {building: 'MOB', floor: 'B', room: 'Central Plant B-01'};
+  // Chiller plant
+  A(P1, {tag: 'CH-1', manufacturer: 'Northstar Chillers (sample)', model: 'NSC-300W', serial: 'DEMO-CH1-04417', capacity: '300 tons', ...plant, areaServed: 'Building chilled water',
+    controlledBy: 'BAS plant controller PC-1', powerPanel: 'MDP', breaker: '3', voltage: '480V/3ph', disconnect: 'Unit-mounted, Central Plant', installYear: String(Y - 21), status: 'Commissioned',
+    notes: 'Lead chiller. Functional test passed; staging verified with CH-2.'});
+  A(P1, {tag: 'CH-2', manufacturer: 'Northstar Chillers (sample)', model: 'NSC-300W', serial: 'DEMO-CH2-03981', capacity: '300 tons', ...plant, areaServed: 'Building chilled water',
+    controlledBy: 'BAS plant controller PC-1', powerPanel: 'MDP', breaker: '4', voltage: '480V/3ph', disconnect: 'Unit-mounted, Central Plant', installYear: String(Y - 26), status: 'Issue',
+    notes: 'ISSUE: high condenser pressure trip on compressor 2 during startup. Service tech scheduled. Unit is past its expected service life – budget for replacement.'});
+  A(P1, {tag: 'CT-1', manufacturer: 'Bluewater Towers (sample)', model: 'BWT-2C-900', serial: 'DEMO-CT1-11872', capacity: '900 GPM, 2-cell', building: 'MOB', floor: 'Roof', room: 'Roof – north', areaServed: 'Condenser water',
+    controlledBy: 'BAS plant controller PC-1', powerPanel: 'MDP', breaker: '7', voltage: '480V/3ph', disconnect: 'Roof, at each cell', installYear: String(Y - 21), status: 'Started up',
+    parts: [B('B-75 (fan belt)', 2, 6, 1, 8, 'One per cell')], notes: 'Basin heater checked. Vibration switch reset tested.'});
+  A(P1, {tag: 'CHWP-1', manufacturer: 'Keystone Pump Co. (sample)', model: 'KP-4x3-10', serial: 'DEMO-P1-55021', capacity: '600 GPM @ 80 ft, 20 HP', ...plant, areaServed: 'Chilled water loop',
+    fedFrom: 'CH-1', controlledBy: 'VFD-CHWP-1 / BAS', powerPanel: '4HA', breaker: '1,3,5', voltage: '480V/3ph', disconnect: 'VFD, Central Plant', installYear: String(Y - 12), status: 'Commissioned'});
+  A(P1, {tag: 'CHWP-2', manufacturer: 'Keystone Pump Co. (sample)', model: 'KP-4x3-10', serial: 'DEMO-P2-55022', capacity: '600 GPM @ 80 ft, 20 HP', ...plant, areaServed: 'Chilled water loop',
+    fedFrom: 'CH-2', controlledBy: 'VFD-CHWP-2 / BAS', powerPanel: '4HA', breaker: '2,4,6', voltage: '480V/3ph', disconnect: 'VFD, Central Plant', installYear: String(Y - 12), status: 'Commissioned'});
+  A(P1, {tag: 'CWP-1', manufacturer: 'Keystone Pump Co. (sample)', model: 'KP-5x4-10', serial: 'DEMO-P3-55023', capacity: '900 GPM @ 60 ft, 25 HP', ...plant, areaServed: 'Condenser water – CH-1',
+    fedFrom: 'CT-1', controlledBy: 'BAS plant controller PC-1', powerPanel: '4HA', breaker: '7,9,11', voltage: '480V/3ph', disconnect: 'Wall, Central Plant', installYear: String(Y - 12), status: 'Commissioned'});
+  A(P1, {tag: 'CWP-2', manufacturer: 'Keystone Pump Co. (sample)', model: 'KP-5x4-10', serial: 'DEMO-P4-55024', capacity: '900 GPM @ 60 ft, 25 HP', ...plant, areaServed: 'Condenser water – CH-2',
+    fedFrom: 'CT-1', controlledBy: 'BAS plant controller PC-1', powerPanel: '4HA', breaker: '8,10,12', voltage: '480V/3ph', disconnect: 'Wall, Central Plant', installYear: String(Y - 12), status: 'Commissioned'});
+  A(P1, {tag: 'B-1', manufacturer: 'Ridgeline Boiler Works (sample)', model: 'RB-2000C', serial: 'DEMO-B1-77310', capacity: '2,000 MBH condensing', ...plant, areaServed: 'Heating hot water',
+    controlledBy: 'Boiler controller / BAS', powerPanel: '2A3', breaker: '21', voltage: '120V/1ph', disconnect: 'Wall switch by boiler', installYear: String(Y - 8), status: 'Commissioned'});
+  A(P1, {tag: 'HWP-1', manufacturer: 'Keystone Pump Co. (sample)', model: 'KP-3x2-8', serial: 'DEMO-P5-55025', capacity: '200 GPM @ 50 ft, 7.5 HP', ...plant, areaServed: 'Heating hot water loop',
+    fedFrom: 'B-1', controlledBy: 'VFD-HWP-1 / BAS', powerPanel: '4HA', breaker: '13,15,17', voltage: '480V/3ph', disconnect: 'VFD, Central Plant', installYear: String(Y - 19), status: 'Commissioned'});
+  // Air side
+  const ahu = (i, o) => A(P1, {tag: `AHU-${i}`, manufacturer: 'Summit Air Systems (sample)', model: `SAS-${i === 3 ? '120' : '160'}`, serial: `DEMO-AHU${i}-2${i}904`,
+    capacity: i === 3 ? '12,000 CFM' : '16,000 CFM', building: 'MOB', floor: 'Roof', room: `Mech Penthouse ${i}`, areaServed: `Floor ${i}`, fedFrom: i === 3 ? 'CHWP-2' : 'CHWP-1',
+    controlledBy: `BAS controller NAE-${i}`, powerPanel: '4HA', voltage: '480V/3ph',
+    disconnect: `Unit-mounted, Penthouse ${i}`, ...o});
+  ahu(1, {breaker: '19,21,23', installYear: String(Y - 6), status: 'Commissioned', parts: [F('24x24x2 MERV 8', 8, 3, 1, 5, 'Pre-filters'), F('24x24x12 MERV 14', 8, 12, 5, 5, 'Final filters'), B('BX-62', 2, 6, 3, 5)]});
+  ahu(2, {breaker: '25,27,29', installYear: String(Y - 6), status: 'Started up', parts: [F('24x24x2 MERV 8', 8, 3, 1, 12, 'Pre-filters'), F('24x24x12 MERV 14', 8, 12, 7, 12, 'Final filters'), B('BX-62', 2, 6, 1, 12)],
+    notes: 'Economizer damper stroke verified. Awaiting TAB report.'});
+  ahu(3, {breaker: '31,33,35', installYear: String(Y - 23), status: 'Installed', parts: [F('20x24x2 MERV 8', 6, 3, -1, 15, 'Pre-filters'), F('20x24x12 MERV 14', 6, 12, 4, 15, 'Final filters'), B('BX-55', 2, 6, 2, 15)],
+    notes: 'Existing unit, re-used. Pre-filters overdue – loaded at last walk-through.'});
+  // VAVs – 5 per floor, fed from that floor's AHU
+  const vavSt = {1: ['Commissioned', 'Commissioned', 'Commissioned', 'Commissioned', 'Commissioned'], 2: ['Started up', 'Started up', 'Started up', 'Issue', 'Started up'], 3: ['Installed', 'Installed', 'Installed', 'Not started', 'Not started']};
+  const rooms = ['Exam suite A', 'Exam suite B', 'Waiting / reception', 'Offices – east', 'Conference'];
+  for (let f = 1; f <= 3; f++) for (let k = 1; k <= 5; k++) {
+    const st = vavSt[f][k - 1];
+    A(P1, {tag: `VAV-${f}-${k}`, manufacturer: 'AirLogic Terminals (sample)', model: k === 3 ? 'ALT-SD-10 w/ HW reheat' : 'ALT-SD-8 w/ HW reheat', serial: `DEMO-V${f}${k}-${3100 + f * 10 + k}`,
+      capacity: k === 3 ? '1,100 CFM' : '650 CFM', building: 'MOB', floor: String(f), room: `Rm ${f}${String(k * 2).padStart(2, '0')}`, areaServed: rooms[k - 1],
+      fedFrom: `AHU-${f}`, controlledBy: `VAV controller (BAS NAE-${f})`, powerPanel: '2A3', breaker: String(1 + (f - 1) * 2 + (k > 3 ? 1 : 0)),
+      voltage: '120V/1ph', disconnect: 'Toggle at controller', installYear: String(f === 3 ? Y - 23 : Y - 6), status: st,
+      notes: st === 'Issue' ? 'ISSUE: damper actuator not responding to BAS command. Controls contractor notified.' : ''});
+  }
+  A(P1, {tag: 'EF-1', type: 'Exhaust Fan', manufacturer: 'Ventex Fans (sample)', model: 'VX-18B', serial: 'DEMO-EF1-6620', capacity: '2,400 CFM, 1 HP', building: 'MOB', floor: 'Roof', room: 'Roof – east', areaServed: 'Toilet exhaust',
+    fedFrom: '', controlledBy: 'Interlocked with AHU-1', powerPanel: '2A3', breaker: '13,15', voltage: '208V/1ph', disconnect: 'At fan curb', installYear: String(Y - 17), status: 'Commissioned', parts: [B('A-42', 1, 6, 1, 20)]});
+  A(P1, {tag: 'EF-2', type: 'Exhaust Fan', manufacturer: 'Ventex Fans (sample)', model: 'VX-12D', serial: 'DEMO-EF2-6621', capacity: '800 CFM, 1/4 HP', building: 'MOB', floor: 'Roof', room: 'Roof – west', areaServed: 'Lab / soiled utility',
+    controlledBy: 'BAS schedule', powerPanel: '2A3', breaker: '17', voltage: '120V/1ph', disconnect: 'At fan curb', installYear: String(Y - 6), status: 'Installed'});
+  A(P1, {tag: 'EF-3', type: 'Exhaust Fan', manufacturer: 'Ventex Fans (sample)', model: 'VX-16B', serial: 'DEMO-EF3-5180', capacity: '1,800 CFM, 3/4 HP', building: 'MOB', floor: 'B', room: 'Central Plant B-01', areaServed: 'Mechanical room ventilation',
+    controlledBy: 'Thermostat in plant', powerPanel: '2A3', breaker: '23,25', voltage: '208V/1ph', disconnect: 'Wall, Central Plant', installYear: String(Y - 22), status: 'Not started', parts: [B('A-38', 1, 6, 4, 20)]});
+  A(P1, {tag: 'RTU-1', manufacturer: 'Horizon Rooftop (sample)', model: 'HR-10G', serial: 'DEMO-RTU1-9045', capacity: '10 tons, gas heat', building: 'MOB', floor: 'Roof', room: 'Roof – over lobby', areaServed: 'Main lobby',
+    controlledBy: 'Standalone thermostat', powerPanel: '4HA', breaker: '37,39,41', voltage: '460V/3ph', disconnect: 'Unit-mounted', installYear: String(Y - 16), status: 'Started up',
+    parts: [F('20x25x2 MERV 13', 4, 3, 1, 10), B('A-48', 1, 6, 3, 10)]});
+  // Second, smaller sample project
+  for (let i = 1; i <= 4; i++) A(P2, {tag: `RTU-${i}`, manufacturer: 'Horizon Rooftop (sample)', model: i < 3 ? 'HR-7G' : 'HR-12G', serial: `DEMO-S-RTU${i}-81${i}0`, capacity: i < 3 ? '7.5 tons, gas heat' : '12.5 tons, gas heat',
+    building: 'Main', floor: 'Roof', room: `Roof – wing ${'ABCD'[i - 1]}`, areaServed: ['Classrooms 101-108', 'Classrooms 109-116', 'Gymnasium', 'Cafeteria / kitchen'][i - 1],
+    powerPanel: 'RP-1', breaker: `${i * 6 - 5},${i * 6 - 3},${i * 6 - 1}`, voltage: '208V/3ph', disconnect: 'Unit-mounted', installYear: String(Y - 1), status: i === 4 ? 'Started up' : 'Commissioned',
+    parts: [F(i < 3 ? '16x25x2 MERV 13' : '20x25x2 MERV 13', 4, 3, 3, 1)]});
+  A(P2, {tag: 'EF-1', type: 'Exhaust Fan', manufacturer: 'Ventex Fans (sample)', model: 'VX-14K', serial: 'DEMO-S-EF1-3301', capacity: '1,200 CFM', building: 'Main', floor: 'Roof', room: 'Roof – kitchen', areaServed: 'Kitchen hood',
+    fedFrom: '', controlledBy: 'Hood control panel', powerPanel: 'RP-1', breaker: '25,27', voltage: '208V/1ph', disconnect: 'At fan', installYear: String(Y - 1), status: 'Installed'});
+  return {projects, assets};
+}
+function demoNameplate(a) {
+  // Draws an obviously-sample "nameplate photo" so the photo strip isn't empty. No network needed.
+  return new Promise(res => {
+    try {
+      const c = document.createElement('canvas'); c.width = 960; c.height = 600; const g = c.getContext('2d');
+      const bg = g.createLinearGradient(0, 0, 960, 600); bg.addColorStop(0, '#5b6670'); bg.addColorStop(1, '#2f373e'); g.fillStyle = bg; g.fillRect(0, 0, 960, 600);
+      const pl = g.createLinearGradient(0, 80, 0, 520); pl.addColorStop(0, '#e9edf0'); pl.addColorStop(.5, '#cfd6db'); pl.addColorStop(1, '#e2e7ea');
+      g.save(); g.translate(480, 300); g.rotate(-0.035); g.fillStyle = pl; g.fillRect(-380, -220, 760, 440); g.strokeStyle = '#8b959c'; g.lineWidth = 6; g.strokeRect(-380, -220, 760, 440);
+      g.fillStyle = '#9aa3a9'; [[-355, -195], [355, -195], [-355, 195], [355, 195]].forEach(([x, y]) => { g.beginPath(); g.arc(x, y, 10, 0, 7); g.fill(); });
+      g.fillStyle = '#1d2a36'; g.font = 'bold 40px Arial, sans-serif'; g.textAlign = 'center'; g.fillText(String(a.manufacturer || '').replace(' (sample)', '').toUpperCase(), 0, -150);
+      g.font = 'bold 22px Arial, sans-serif'; g.fillStyle = '#b3261e'; g.fillText('SAMPLE NAMEPLATE – DEMO DATA', 0, -112);
+      g.textAlign = 'left'; g.fillStyle = '#1d2a36'; g.font = '26px "Courier New", monospace';
+      [['MODEL', a.model], ['SERIAL', a.serial], ['CAPACITY', a.capacity], ['VOLTAGE', a.voltage], ['MFG YEAR', a.installYear], ['TAG', a.tag]].forEach(([k, v], i) => {
+        g.font = 'bold 24px Arial, sans-serif'; g.fillText(k, -330, -55 + i * 46); g.font = '28px "Courier New", monospace'; g.fillText(String(v || ''), -130, -55 + i * 46);
+        g.strokeStyle = '#a7b0b6'; g.lineWidth = 1; g.beginPath(); g.moveTo(-140, -45 + i * 46); g.lineTo(330, -45 + i * 46); g.stroke(); });
+      g.restore();
+      c.toBlob(b => res(b), 'image/jpeg', 0.8);
+    } catch (e) { res(null); }
+  });
+}
+async function seedDemo() {
+  const {projects, assets} = demoData();
+  await DB.put('projects', ...projects); await DB.put('assets', ...assets);
+  for (const tag of ['CH-1', 'AHU-1', 'RTU-1']) {
+    const a = assets.find(x => x.projectId === 'demo-mob' && x.tag === tag); const b = a && await demoNameplate(a);
+    if (b) await Data.addPhoto(a.id, b);
+  }
+}
+async function ensureDemo() { if (!DEMO) return; if (!(await DB.all('projects')).length) await seedDemo(); }
+async function resetDemo() {
+  if (!DEMO) return;
+  await DB.clear(); ['at-parts-inc', 'at-label-opts'].forEach(k => localStorage.removeItem(LSK(k))); sessionStorage.removeItem(LSK('at-filters'));
+  Object.keys(filterState).forEach(k => delete filterState[k]);
+  await seedDemo();
+}
+function demoBanner() {
+  document.body.classList.add('demo');
+  const b = document.createElement('div'); b.className = 'demo-banner no-print'; b.id = 'demoBanner'; b.setAttribute('role', 'note');
+  b.innerHTML = `<span class="db-txt"><span><b>Demo mode</b> – sample data</span></span><span class="db-btns"><button class="btn sm" id="demoReset">Reset demo</button><button class="btn sm" id="demoExit">Exit demo</button></span>`;
+  document.body.insertBefore(b, document.body.firstChild);
+  $('#demoReset').onclick = async () => {
+    if (!await confirmBox('Reset demo?', 'Puts the sample projects back the way they started. Your own data (outside demo mode) is not affected.', 'Reset demo')) return;
+    await resetDemo(); toast('Demo data reset'); if (location.hash.replace(/^#\/?/, '')) go('/'); else route();
+  };
+  $('#demoExit').onclick = () => { location.href = location.pathname + '#/'; };
+}
+
 /* ---------------- boot ---------------- */
 // html5-qrcode can leave a pending video.play() promise when the camera is stopped quickly; that rejection is harmless.
 window.addEventListener('unhandledrejection', e => { const r = e.reason; if (r && r.name === 'AbortError' && /play\(\)/.test(r.message || '')) e.preventDefault(); });
 window.AssetTagger = {Data, DB, buildExport, planImport, parseImportFile, handleScan, normalizeStatus, normalizeType, guessTypeFromTag, nextTag, extractTag, computeAge, computeRemaining, defaultLife, LIFE_DEFAULTS,
   splitTags, fedList, normPanel, relIndex, upstreamPath, renameRefs, powerLine, typeSummary, applyFilter, FIELDS,
-  addMonths, normPart, partNextDue, partStatus, partHits, collectParts, partTotals, partsContext, partsEmail, parseEmails, parseFreq, applyPartsImport, buildPartsXlsx, version: APP_VERSION};
+  addMonths, normPart, partNextDue, partStatus, partHits, collectParts, partTotals, partsContext, partsEmail, parseEmails, parseFreq, applyPartsImport, buildPartsXlsx, version: APP_VERSION,
+  demo: DEMO, dbName: DB_NAME, seedDemo: () => seedDemo(), resetDemo: () => resetDemo()};
 if ('serviceWorker' in navigator && window.isSecureContext && location.protocol !== 'file:') {
   window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js', {scope: './'}).catch(e => console.warn('SW registration failed', e)));
 }
-if (navigator.storage && navigator.storage.persist) navigator.storage.persisted().then(p => { if (!p) navigator.storage.persist().catch(() => {}); }).catch(() => {});
-route();
+if (!DEMO && navigator.storage && navigator.storage.persist) navigator.storage.persisted().then(p => { if (!p) navigator.storage.persist().catch(() => {}); }).catch(() => {});
+if (DEMO) { demoBanner(); ensureDemo().catch(e => console.error('Demo data failed', e)).then(route); }
+else route();
 })();

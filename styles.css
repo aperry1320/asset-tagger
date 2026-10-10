@@ -252,3 +252,15 @@ ul.tree li.tn-leaf > .tn-row{margin-left:26px}
 .pn-row .t{font-size:18px;font-weight:750;color:var(--primary)}
 .pn-ckt{flex:0 0 auto;font-weight:800;font-size:16px;text-align:right;max-width:40%;word-break:break-word}
 @media print{.pn-card,.tree-card{break-inside:avoid;border:1px solid #bbb}.pn-row .t{color:#000}}
+/* Demo mode banner (?demo=1) */
+.demo-banner{display:flex;flex-wrap:nowrap;align-items:center;justify-content:space-between;gap:4px 8px;
+  padding:calc(5px + env(safe-area-inset-top)) 8px 5px;background:#fff3cd;color:#5c4400;border-bottom:1px solid #e9d18a;font-size:14px;line-height:1.2}
+.demo-banner .db-txt{display:flex;align-items:center;gap:6px}
+.demo-banner .db-txt::before{content:'';width:10px;height:10px;border-radius:50%;background:#e0a100;flex:0 0 auto}
+.demo-banner .db-btns{display:flex;gap:6px;margin-left:auto}
+.demo-banner .db-txt{min-width:0;flex:1 1 auto}
+.demo-banner .db-btns .btn{white-space:nowrap}
+.demo-banner .btn.sm{min-height:36px;padding:0 10px;font-size:14px;background:#fffaf0;border-color:#d9bf73;color:#5c4400}
+body.demo .topbar{padding-top:6px}
+@media (prefers-color-scheme: dark){.demo-banner{background:#3a2f0b;color:#ffe08a;border-color:#5d4b14}.demo-banner .btn.sm{background:#2b230a;color:#ffe08a;border-color:#6b5717}}
+@media print{.demo-banner{display:none}}

@@ -1,9 +1,22 @@
-# Asset Tagger (v1.3.0)
+# Asset Tagger (v1.4.0)
+
+**Showcase page:** https://aperry1320.github.io/asset-tagger/demo/ ·
+**Live demo with sample data:** https://aperry1320.github.io/asset-tagger/?demo=1
 
 Offline-first, mobile-first web app for tagging HVAC / mechanical equipment on job sites
 (AHUs, RTUs, chillers, boilers, pumps, VAVs, FCUs, exhaust fans, cooling towers, heat exchangers, VRF units…).
 
 Plain static files. No build step, no server code, no account. All data stays in the phone's browser (IndexedDB).
+
+## Demo mode & showcase (v1.4.0)
+- `/demo/` is a static showcase / landing page (no JavaScript). The app's service worker deliberately passes `/demo/` requests to the network,
+  so the page is never replaced by the app shell.
+- Opening the app with `?demo=1` starts **demo mode**: a separate IndexedDB database (`asset-tagger-demo`) and separate `demo:`-prefixed
+  storage keys, preloaded with a fictional "Sample Medical Office Building" (chiller plant, boiler, 3 AHUs, 15 VAVs, exhaust fans, RTU,
+  filters & belts with items due next month and one overdue, power panels MDP / 4HA / 2A3) and a small sample school project.
+  Dates are generated relative to today so the reminders and ages always look current.
+- A yellow **Demo mode – sample data** banner shows **Reset demo** (restores the sample data) and **Exit demo** (back to the normal app).
+  A user's real data in the normal `asset-tagger` database is never read or changed in demo mode.
 
 ## Features
 - **Projects / job sites** with client, address and notes. Home screen shows progress (commissioned %) and open issues.

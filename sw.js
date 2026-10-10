@@ -1,5 +1,5 @@
 /* Asset Tagger service worker: precache app shell + libraries so the app works with no signal. */
-const CACHE = 'asset-tagger-v1.3.0';
+const CACHE = 'asset-tagger-v1.4.0';
 const ASSETS = [
   './', './index.html', './app.js', './styles.css', './manifest.webmanifest',
   './vendor/qrcode-generator.js', './vendor/html5-qrcode.min.js', './vendor/xlsx.full.min.js',
@@ -15,6 +15,8 @@ self.addEventListener('activate', e => {
 self.addEventListener('fetch', e => {
   const req = e.request;
   if (req.method !== 'GET' || new URL(req.url).origin !== self.location.origin) return;
+  // The /demo/ showcase site is a separate static page: let the network handle it, never answer it with the app shell.
+  if (req.url.startsWith(new URL('./demo/', self.registration.scope).href)) return;
   e.respondWith(caches.open(CACHE).then(async cache => {
     const cached = await cache.match(req, {ignoreSearch: true});
     const network = fetch(req).then(res => { if (res && res.ok) cache.put(req, res.clone()); return res; }).catch(() => null);
