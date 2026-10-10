@@ -2,7 +2,7 @@
    Vanilla JS, data in IndexedDB. Vendor libs (loaded on demand): html5-qrcode, SheetJS (xlsx); qrcode-generator loaded up front. */
 'use strict';
 (() => {
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.5.0';
 /* Demo mode (?demo=1): separate IndexedDB + storage keys, preloaded sample data. Never touches the real 'asset-tagger' DB. */
 const DEMO = /(?:^|[?&])demo=1(?:&|$)/.test(location.search.slice(1));
 const DB_NAME = DEMO ? 'asset-tagger-demo' : 'asset-tagger';
@@ -345,13 +345,13 @@ const Data = {
     if (photos.length) await DB.del('photos', ...photos.map(p => p.id));
     await DB.del('assets', id);
   },
-  photos: async aid => (await DB.by('photos', 'assetId', aid)).sort((a, b) => natCmp(a.createdAt, b.createdAt)),
+  photos: async aid => (await DB.by('photos', 'assetId', aid)).filter(p => !p.inspId).sort((a, b) => natCmp(a.createdAt, b.createdAt)),
   addPhoto: (assetId, blob) => DB.put('photos', {id: uid(), assetId, blob, type: blob.type || 'image/jpeg', createdAt: nowISO()}),
   deletePhoto: id => DB.del('photos', id),
   async findByTag(tag) { const t = normTag(tag); return (await DB.all('assets')).filter(a => normTag(a.tag) === t); },
 };
 async function photoCounts() {
-  const m = {}; (await DB.all('photos')).forEach(p => { m[p.assetId] = (m[p.assetId] || 0) + 1; }); return m;
+  const m = {}; (await DB.all('photos')).forEach(p => { if (p.inspId) return; m[p.assetId] = (m[p.assetId] || 0) + 1; }); return m;
 }
 
 /* ---------------- modal helper ---------------- */
@@ -709,6 +709,662 @@ async function renderParts(pid, q) {
   };
 }
 
+/* ---------------- Inspection checklists ----------------
+   Templates: per equipment type, defaults below; edited copies saved in localStorage (LSK('at-insp-tpl')) and in backups.
+   Asset: a.inspFreq ('' = type default, '0' = no schedule, else months), a.inspExtra = [item], a.inspections = [inspection].
+   Inspection: {id, date, inspector, status:'draft'|'complete', items:[{id,text,required,reading,unit,result:''|'done'|'na'|'fail',value,note,resolvedAt}], notes, signature, startedAt, completedAt}.
+   Item photos live in the photos store with {inspId, itemId} so they never show as nameplate photos. */
+const INSP_TYPES = TYPES;
+const defic = n => `${n} ${n === 1 ? 'deficiency' : 'deficiencies'}`;
+const R = (text, o = {}) => ({text, required: o.opt ? false : true, reading: !!o.unit, unit: o.unit || ''});
+const INSP_DEFAULTS = {
+  'AHU': {freq: 3, items: [R('Check / replace filters'), R('Inspect belts & tension – adjust or replace'), R('Lubricate fan & motor bearings'), R('Check coils clean (heating / cooling)'),
+    R('Check drain pan & condensate line clear'), R('Check dampers & actuators stroke freely'), R('Check fan motor amps', {unit: 'A'}), R('Measure supply air temperature', {unit: '°F', opt: 1}),
+    R('Verify controls / sensors reading correctly'), R('Check for unusual noise / vibration'), R('Check access doors, gaskets & casing', {opt: 1})]},
+  'RTU': {freq: 3, items: [R('Check / replace filters'), R('Inspect belts & tension – adjust or replace'), R('Clean / inspect condenser & evaporator coils'), R('Check drain pan & condensate line clear'),
+    R('Check compressor amps', {unit: 'A'}), R('Check refrigerant suction pressure', {unit: 'psig', opt: 1}), R('Inspect economizer damper & actuator'), R('Inspect gas heat: burners, flue, ignition', {opt: 1}),
+    R('Measure supply air temperature', {unit: '°F'}), R('Verify thermostat / controls'), R('Check electrical connections & contactors'), R('Check for unusual noise / vibration'), R('Check curb, panels & roof penetrations', {opt: 1})]},
+  'Chiller': {freq: 3, items: [R('Review operating log & alarm history'), R('Record chilled water leaving temperature', {unit: '°F'}), R('Record condenser water entering temperature', {unit: '°F'}),
+    R('Record evaporator refrigerant pressure', {unit: 'psig'}), R('Record condenser refrigerant pressure', {unit: 'psig'}), R('Check compressor amps', {unit: 'A'}), R('Check oil level & oil pressure'),
+    R('Check for refrigerant leaks'), R('Verify water flow & flow switches'), R('Inspect starter / electrical connections'), R('Verify controls, setpoints & safeties'), R('Check for unusual noise / vibration'), R('Check insulation & condensation', {opt: 1})]},
+  'Boiler': {freq: 3, items: [R('Review operating log & alarm history'), R('Inspect burner flame & combustion'), R('Inspect flue / venting & combustion air openings'), R('Test low-water cutoff'),
+    R('Check operating & high-limit controls'), R('Record supply water temperature', {unit: '°F'}), R('Record system pressure', {unit: 'psi'}), R('Check for leaks & corrosion'),
+    R('Check gas pressure at manifold', {unit: 'in. w.c.', opt: 1}), R('Test safety / relief valve', {opt: 1}), R('Check condensate neutralizer', {opt: 1})]},
+  'Pump': {freq: 6, items: [R('Check for leaks at seals / packing'), R('Lubricate pump & motor bearings'), R('Check coupling & alignment'), R('Record differential pressure', {unit: 'psi', opt: 1}),
+    R('Check motor amps', {unit: 'A'}), R('Check for unusual noise / vibration'), R('Check strainer clean'), R('Verify VFD / controls operation'), R('Check isolation valves & gauges', {opt: 1})]},
+  'VAV': {freq: 12, items: [R('Verify damper actuator strokes full open / closed'), R('Check airflow vs. design', {unit: 'CFM', opt: 1}), R('Verify reheat valve operation', {opt: 1}),
+    R('Verify space temperature sensor', {unit: '°F'}), R('Check controller communicating with BAS'), R('Inspect box & duct connections for leaks')]},
+  'FCU': {freq: 6, items: [R('Check / replace filter'), R('Clean coil'), R('Check drain pan & condensate line clear'), R('Check fan motor & bearings'), R('Verify valve & controls operation'),
+    R('Verify thermostat / sensor'), R('Check for unusual noise / vibration')]},
+  'Exhaust Fan': {freq: 6, items: [R('Inspect belt & tension (belt drive)', {opt: 1}), R('Lubricate bearings'), R('Check fan motor amps', {unit: 'A'}), R('Verify rotation & airflow'), R('Check backdraft damper'),
+    R('Check for unusual noise / vibration'), R('Check disconnect & wiring'), R('Inspect curb, housing & bird screen', {opt: 1})]},
+  'Cooling Tower': {freq: 1, items: [R('Inspect fill & drift eliminators'), R('Check basin water level & makeup valve'), R('Clean basin & strainers'), R('Check water treatment / chemical levels'),
+    R('Inspect fan belts & tension / gearbox oil level'), R('Check fan motor amps', {unit: 'A'}), R('Test vibration switch'), R('Check spray nozzles / water distribution'),
+    R('Check basin heater operation', {opt: 1}), R('Record leaving water temperature', {unit: '°F', opt: 1})]},
+  'Heat Exchanger': {freq: 12, items: [R('Record primary entering / leaving temperature', {unit: '°F'}), R('Record secondary leaving temperature', {unit: '°F'}), R('Check pressure drop', {unit: 'psi', opt: 1}),
+    R('Check for leaks at gaskets / connections'), R('Verify control valve operation'), R('Inspect insulation'), R('Check relief valve & air vents', {opt: 1})]},
+  'VRF Unit': {freq: 6, items: [R('Clean / replace filters'), R('Clean coils'), R('Check drain pan / condensate pump'), R('Check error codes & alarm history'), R('Check refrigerant pressure', {unit: 'psig', opt: 1}),
+    R('Check compressor amps', {unit: 'A', opt: 1}), R('Verify controls / remote controller'), R('Check for unusual noise / vibration'), R('Inspect refrigerant piping insulation')]},
+  'Other': {freq: 12, items: [R('Visual inspection – overall condition'), R('Check for leaks'), R('Check electrical connections'), R('Verify controls / operation'), R('Check for unusual noise / vibration'), R('Clean equipment & area', {opt: 1})]},
+};
+const INSP_FREQS = [[1, 'Monthly'], [2, 'Every 2 months'], [3, 'Quarterly'], [4, 'Every 4 months'], [6, 'Semi-annual'], [12, 'Annual'], [24, 'Every 2 years']];
+const inspFreqLabel = m => { m = +m; if (!m) return 'No schedule'; const f = INSP_FREQS.find(x => x[0] === m); return f ? f[1] : `Every ${m} months`; };
+const normItem = (it, keepResult) => {
+  it = it || {};
+  const unit = String(it.unit ?? '').trim().slice(0, 20);
+  const o = {id: it.id || uid(), text: String(it.text ?? '').trim().slice(0, 200), required: it.required !== false, reading: !!(it.reading || unit), unit};
+  if (keepResult) { o.result = ['done', 'na', 'fail'].includes(it.result) ? it.result : ''; o.value = String(it.value ?? '').trim(); o.note = String(it.note ?? '').trim(); o.resolvedAt = it.resolvedAt || ''; o.extra = it.extra || ''; }
+  return o;
+};
+function loadTplStore() { try { return JSON.parse(localStorage.getItem(LSK('at-insp-tpl')) || '{}') || {}; } catch (e) { return {}; } }
+function saveTplStore(s) { localStorage.setItem(LSK('at-insp-tpl'), JSON.stringify(s)); }
+const tplType = type => INSP_DEFAULTS[type] ? type : 'Other';
+function defaultTemplate(type) { const d = INSP_DEFAULTS[tplType(type)]; return {freq: d.freq, items: d.items.map((x, i) => normItem({...x, id: `d-${slug(tplType(type)).toLowerCase()}-${i}`}))}; }
+function getTemplate(type) {
+  const t = tplType(type), s = loadTplStore()[t];
+  if (s && Array.isArray(s.items)) return {freq: Number.isFinite(+s.freq) ? +s.freq : INSP_DEFAULTS[t].freq, items: s.items.map(x => normItem(x)).filter(x => x.text), custom: true};
+  return defaultTemplate(t);
+}
+const inspList = a => (Array.isArray(a && a.inspections) ? a.inspections : []).slice().sort((x, y) => natCmp(y.date, x.date) || natCmp(y.startedAt, x.startedAt));
+const assetExtra = a => (Array.isArray(a && a.inspExtra) ? a.inspExtra : []).map(x => normItem(x)).filter(x => x.text);
+/** Months between inspections for this asset: per-asset override, else the type template's default. 0 = not scheduled. */
+function inspFreqOf(a) { const v = a && a.inspFreq; if (v !== undefined && v !== null && v !== '' && isFinite(+v)) return Math.max(0, Math.round(+v)); return getTemplate(a && a.type).freq; }
+function inspCounts(insp) {
+  const items = insp.items || [], c = {total: items.length, done: 0, na: 0, fail: 0, open: 0, reqTotal: 0, reqLeft: [], failNoNote: []};
+  items.forEach(it => {
+    if (it.result === 'done') c.done++; else if (it.result === 'na') c.na++; else if (it.result === 'fail') { c.fail++; if (!it.resolvedAt) c.open++; }
+    if (it.required) c.reqTotal++;
+    if (it.result === 'fail' && !String(it.note || '').trim()) c.failNoNote.push(it);
+    else if (it.required && !it.result) c.reqLeft.push(it);
+  });
+  c.answered = c.done + c.na + c.fail;
+  c.reqDone = c.reqTotal - items.filter(it => it.required && (!it.result || (it.result === 'fail' && !String(it.note || '').trim()))).length;
+  return c;
+}
+const inspResult = insp => insp.status !== 'complete' ? 'In progress' : (inspCounts(insp).fail ? 'Passed with deficiencies' : 'Passed');
+const inspResultCls = r => r === 'Passed' ? 'ir-pass' : r === 'Passed with deficiencies' ? 'ir-def' : 'ir-prog';
+const inspResultPill = insp => { const r = inspResult(insp); return `<span class="pill ${inspResultCls(r)}">${esc(r)}</span>`; };
+const lastComplete = a => inspList(a).find(i => i.status === 'complete') || null;
+const openDraft = a => inspList(a).find(i => i.status !== 'complete') || null;
+const openDeficiencies = a => inspList(a).filter(i => i.status === 'complete').reduce((n, i) => n + inspCounts(i).open, 0);
+function inspNextDue(a) { const f = inspFreqOf(a); if (!f) return ''; const l = lastComplete(a); return l ? addMonths(l.date, f) : ''; }
+/** {key, label, cls}: overdue / this / next / ok / never / none (no schedule). */
+function inspDueStatus(a, t = today()) {
+  const f = inspFreqOf(a); if (!f) return {key: 'none', label: 'Not scheduled', cls: 'pt-none'};
+  const d = inspNextDue(a); if (!d) return {key: 'never', label: 'Not inspected yet', cls: 'pt-none'};
+  if (d < t) return {key: 'overdue', label: 'Inspection overdue', cls: 'pt-over'};
+  const mk = d.slice(0, 7);
+  if (mk === t.slice(0, 7)) return {key: 'this', label: 'Inspection due this month', cls: 'pt-soon'};
+  if (mk === shiftMonth(t.slice(0, 7), 1)) return {key: 'next', label: 'Inspection due next month', cls: 'pt-next'};
+  return {key: 'ok', label: 'Inspection scheduled', cls: 'pt-ok'};
+}
+function newInspection(a) {
+  const tpl = getTemplate(a.type);
+  const items = [...tpl.items.map(x => normItem({...x, id: uid()}, true)), ...assetExtra(a).map(x => normItem({...x, id: uid(), extra: 'asset'}, true))];
+  return {id: uid(), date: today(), inspector: localStorage.getItem(LSK('at-inspector')) || '', status: 'draft', items, notes: '', signature: '', startedAt: nowISO(), completedAt: '', template: tplType(a.type)};
+}
+async function saveInspection(aid, insp) {
+  const a = await Data.asset(aid); if (!a) return null;
+  const list = Array.isArray(a.inspections) ? a.inspections.slice() : [];
+  const i = list.findIndex(x => x.id === insp.id); insp.updatedAt = nowISO();
+  if (i >= 0) list[i] = insp; else list.push(insp);
+  a.inspections = list; await Data.saveAsset(a); return a;
+}
+async function deleteInspection(aid, iid) {
+  const a = await Data.asset(aid); if (!a) return;
+  a.inspections = (a.inspections || []).filter(x => x.id !== iid); await Data.saveAsset(a);
+  const ph = await inspPhotos(aid, iid); if (ph.length) await DB.del('photos', ...ph.map(p => p.id));
+}
+const inspPhotos = async (aid, iid) => (await DB.by('photos', 'assetId', aid)).filter(p => p.inspId && (!iid || p.inspId === iid)).sort((a, b) => natCmp(a.createdAt, b.createdAt));
+/** Short status line for lists: "Inspected Sep 12, 2026 · Passed" */
+function inspLine(a) {
+  const l = lastComplete(a), d = openDraft(a), parts = [];
+  if (l) parts.push(`Inspected ${fmtDate(l.date).replace(', ' + new Date().getFullYear(), '')} · ${inspResult(l) === 'Passed' ? 'Passed' : 'Passed w/ ' + defic(inspCounts(l).fail)}`);
+  if (d) parts.push('inspection in progress');
+  return parts.join(' · ');
+}
+function inspPill(a) {
+  const open = openDeficiencies(a), st = inspDueStatus(a), dr = openDraft(a);
+  if (open) return `<span class="pill pt-pill pt-over">${defic(open)} open</span>`;
+  if (dr) return '<span class="pill pt-pill ir-prog">Insp. in progress</span>';
+  if (st.key === 'overdue') return '<span class="pill pt-pill pt-over">Insp. overdue</span>';
+  if (st.key === 'this') return '<span class="pill pt-pill pt-soon">Insp. due</span>';
+  return '';
+}
+
+const inspBase = (pid, aid) => `/p/${encodeURIComponent(pid)}/a/${encodeURIComponent(aid)}`;
+const inspHref = (pid, aid, iid, sub = '') => `#${inspBase(pid, aid)}/i/${encodeURIComponent(iid)}${sub}`;
+/** Asset detail card: last result, next due, start / continue, history. */
+function inspCardHtml(pid, a) {
+  const list = inspList(a), last = lastComplete(a), draft = openDraft(a), f = inspFreqOf(a), st = inspDueStatus(a), nd = inspNextDue(a), open = openDeficiencies(a);
+  const tpl = getTemplate(a.type), nItems = tpl.items.length + assetExtra(a).length;
+  const hist = list.map(i => { const c = inspCounts(i);
+    return `<a class="ih-row" href="${inspHref(pid, a.id, i.id)}"><div class="main">
+      <div><b>${esc(fmtDate(i.date))}</b> ${inspResultPill(i)}</div>
+      <div class="small muted">${esc(i.inspector || 'No inspector')} · ${i.status === 'complete' ? `${c.done} done, ${c.na} N/A, ${c.fail} failed` : `${c.answered}/${c.total} answered`}${c.open ? ` · <b class="over-txt">${defic(c.open)} open</b>` : ''}</div></div><span class="chev">›</span></a>`; }).join('');
+  return `<div class="card insp-card" id="inspCard"><div class="lbl">Inspections</div>
+    <div class="insp-sum">
+      <div><div class="life-l">Last inspection</div><div class="is-v">${last ? esc(fmtDate(last.date)) : '—'}</div>${last ? `<div>${inspResultPill(last)}</div>` : '<div class="small muted">None yet</div>'}</div>
+      <div><div class="life-l">Next due</div><div class="is-v">${nd ? esc(fmtDate(nd)) : f ? 'Now' : '—'}</div><div><span class="pill pt-pill ${st.cls}">${esc(st.key === 'ok' ? 'Scheduled' : st.label.replace('Inspection ', '').replace(/^./, c => c.toUpperCase()))}</span></div></div>
+    </div>
+    ${open ? `<div class="notice warn small" style="margin:10px 0 0"><b>${defic(open)} open</b> from past inspections – open the inspection to see notes / mark resolved.</div>` : ''}
+    <p class="small muted" style="margin:10px 0 0">${esc(inspFreqLabel(f))}${a.inspFreq === undefined || a.inspFreq === '' ? ' (type default)' : ''} · ${nItems} checklist item${nItems === 1 ? '' : 's'} (${esc(tplType(a.type))}${assetExtra(a).length ? ` + ${assetExtra(a).length} for this unit` : ''})</p>
+    <div class="row" style="margin:10px 0 0">${draft
+      ? `<a class="btn primary" id="bInspGo" href="${inspHref(pid, a.id, draft.id)}">▶ Continue inspection (${inspCounts(draft).answered}/${draft.items.length})</a>`
+      : `<button class="btn primary" id="bInspStart">✓ Start inspection</button>`}
+      <button class="btn sm" id="bInspSetup">Checklist &amp; schedule</button></div>
+    ${hist ? `<div class="lbl" style="margin-top:14px">History (${list.length})</div><div class="ih-list">${hist}</div>` : ''}
+  </div>`;
+}
+async function startInspection(pid, aid) {
+  const a = await Data.asset(aid); if (!a) return;
+  const d = openDraft(a); if (d) return go(`${inspBase(pid, aid)}/i/${encodeURIComponent(d.id)}`);
+  const insp = newInspection(a);
+  if (!insp.items.length) { toast('This checklist has no items – add some in Checklist & schedule'); return; }
+  await saveInspection(aid, insp);
+  go(`${inspBase(pid, aid)}/i/${encodeURIComponent(insp.id)}`);
+}
+/** Shared item-list editor (Settings templates + per-asset extras). items: [{id,text,required,reading,unit}] (mutated). */
+function itemsEditor(host, items, onChange) {
+  const row = (it, i) => `<div class="ti-row" data-i="${i}">
+    <div class="ti-top"><span class="ti-n">${i + 1}</span><input data-k="text" value="${esc(it.text)}" placeholder="Task, e.g. Check belt tension" aria-label="Item ${i + 1} text">
+      <button type="button" class="icon-btn ti-rm" data-rm="${i}" aria-label="Remove item ${i + 1}">${ICON.close}</button></div>
+    <div class="ti-opts">
+      <label class="chk"><input type="checkbox" data-k="required" ${it.required ? 'checked' : ''}> Required</label>
+      <label class="chk"><input type="checkbox" data-k="reading" ${it.reading ? 'checked' : ''}> Reading</label>
+      <input class="ti-unit" data-k="unit" value="${esc(it.unit)}" placeholder="unit (A, °F, psi)" aria-label="Reading unit" ${it.reading ? '' : 'hidden'}>
+      <span class="ti-mv"><button type="button" class="btn sm" data-up="${i}" aria-label="Move up" ${i ? '' : 'disabled'}>↑</button><button type="button" class="btn sm" data-dn="${i}" aria-label="Move down" ${i < items.length - 1 ? '' : 'disabled'}>↓</button></span>
+    </div></div>`;
+  const render = () => { host.innerHTML = items.length ? items.map(row).join('') : '<p class="muted small" style="margin:0 0 8px">No items.</p>'; };
+  render();
+  host.oninput = host.onchange = e => {
+    const el = e.target.closest('[data-k]'), r = e.target.closest('.ti-row'); if (!el || !r) return;
+    const it = items[+r.dataset.i], k = el.dataset.k;
+    if (k === 'text' || k === 'unit') it[k] = el.value;
+    else { it[k] = el.checked; if (k === 'reading') { const u = $('.ti-unit', r); u.hidden = !el.checked; if (el.checked) u.focus(); } }
+    onChange && onChange();
+  };
+  host.onclick = e => {
+    const b = e.target.closest('[data-rm],[data-up],[data-dn]'); if (!b) return;
+    if (b.dataset.rm != null) items.splice(+b.dataset.rm, 1);
+    else { const i = +(b.dataset.up ?? b.dataset.dn), j = b.dataset.up != null ? i - 1 : i + 1; if (j < 0 || j >= items.length) return; [items[i], items[j]] = [items[j], items[i]]; }
+    render(); onChange && onChange();
+  };
+  return {render, add() { items.push(normItem({text: '', required: true})); render(); const f = host.querySelector(`.ti-row[data-i="${items.length - 1}"] [data-k="text"]`); if (f) f.focus(); onChange && onChange(); }};
+}
+const freqOptions = (sel, withDefault, defFreq) => (withDefault ? `<option value="" ${sel === '' ? 'selected' : ''}>Type default (${esc(inspFreqLabel(defFreq))})</option>` : '') +
+  INSP_FREQS.map(([m, l]) => `<option value="${m}" ${String(sel) === String(m) ? 'selected' : ''}>${l}</option>`).join('') +
+  `<option value="0" ${String(sel) === '0' ? 'selected' : ''}>No schedule</option>` +
+  (sel !== '' && +sel && !INSP_FREQS.some(f => f[0] === +sel) ? `<option value="${esc(sel)}" selected>Every ${esc(sel)} months</option>` : '');
+function inspSetupDialog(pid, a) {
+  const tpl = getTemplate(a.type), extra = assetExtra(a).map(x => ({...x}));
+  const sel = a.inspFreq === undefined || a.inspFreq === null ? '' : String(a.inspFreq);
+  const m = modal({title: `${a.tag} – checklist & schedule`, body: `
+    <div class="field"><label for="isFreq">Inspect every</label><select id="isFreq">${freqOptions(sel, true, tpl.freq)}</select>
+      <p class="muted small" style="margin:6px 0 0">Next due = last completed inspection + this interval.</p></div>
+    <details class="filters"><summary>${esc(tplType(a.type))} checklist (${tpl.items.length} items${tpl.custom ? ', customized' : ''})</summary>
+      <ol class="tpl-peek">${tpl.items.map(x => `<li>${esc(x.text)}${x.required ? '' : ' <span class="muted">(optional)</span>'}${x.reading ? ` <span class="badge">${esc(x.unit || 'reading')}</span>` : ''}</li>`).join('')}</ol>
+      <p class="muted small">Edit the ${esc(tplType(a.type))} checklist for all units in <a data-close href="#/settings/checklists/${encodeURIComponent(tplType(a.type))}">Settings → Inspection checklists</a>.</p></details>
+    <div class="lbl" style="margin-top:12px">Extra items for this unit only</div>
+    <div id="isExtra"></div>
+    <button type="button" class="btn sm" id="isAdd">+ Add item</button>`,
+    actions: [{label: 'Cancel'}, {label: 'Save', cls: 'primary', onClick: async d => {
+      const cur = await Data.asset(a.id); if (!cur) return;
+      cur.inspFreq = $('#isFreq', d).value;
+      cur.inspExtra = extra.map(x => normItem(x)).filter(x => x.text);
+      await Data.saveAsset(cur); toast('Checklist saved'); route();
+    }}]});
+  const ed = itemsEditor($('#isExtra', m.el), extra);
+  $('#isAdd', m.el).onclick = () => ed.add();
+}
+
+const RES_LABEL = {done: 'Done', na: 'N/A', fail: 'Fail', '': 'Not checked'};
+const RES_ICON = {done: '✓', na: 'N/A', fail: '✗', '': '–'};
+const addInspPhoto = (assetId, inspId, itemId, blob) => DB.put('photos', {id: uid(), assetId, inspId, itemId, blob, type: blob.type || 'image/jpeg', createdAt: nowISO()});
+async function renderInspection(pid, aid, iid, q) {
+  const [p, a] = await Promise.all([Data.project(pid), Data.asset(aid)]);
+  if (!p) return go('/', true);
+  if (!a) return go(`/p/${encodeURIComponent(pid)}`, true);
+  const insp = (a.inspections || []).find(x => x.id === iid);
+  if (!insp) { toast('Inspection not found'); return go(inspBase(pid, aid), true); }
+  insp.items = (insp.items || []).map(x => normItem(x, true));
+  if (q.get('report')) return renderInspReport(p, a, insp);
+  if (insp.status === 'complete') return renderInspView(p, a, insp);
+  return renderInspEdit(p, a, insp);
+}
+function renderInspEdit(p, a, insp) {
+  const pid = p.id, aid = a.id, back = inspBase(pid, aid);
+  setChrome(`Inspect ${a.tag}`, back, `<button class="icon-btn" id="iMenu" aria-label="Inspection menu">${ICON.more}</button>`);
+  let photos = [];
+  const itemHtml = (it, i) => {
+    const ph = photos.filter(x => x.itemId === it.id);
+    const showNote = it.result === 'fail' || it.note || it._noteOpen;
+    return `<div class="ii card ${it.result ? 'r-' + it.result : ''}" data-id="${esc(it.id)}" id="ii-${esc(it.id)}">
+      <div class="ii-top"><span class="ii-n">${i + 1}</span><div class="ii-t">${esc(it.text)}
+        <div class="ii-tags">${it.required ? '<span class="badge req-b">Required</span>' : '<span class="badge opt-b">Optional</span>'}${it.extra === 'asset' ? '<span class="badge">This unit</span>' : it.extra === 'adhoc' ? '<span class="badge">Added</span>' : ''}</div></div></div>
+      <div class="ir-btns" role="group" aria-label="Result for ${esc(it.text)}">
+        <button type="button" data-r="done" class="${it.result === 'done' ? 'on' : ''}" aria-pressed="${it.result === 'done'}">✓ Done</button>
+        <button type="button" data-r="na" class="${it.result === 'na' ? 'on' : ''}" aria-pressed="${it.result === 'na'}">N/A</button>
+        <button type="button" data-r="fail" class="${it.result === 'fail' ? 'on' : ''}" aria-pressed="${it.result === 'fail'}">✗ Fail</button></div>
+      ${it.reading ? `<div class="ii-read"><label for="rv-${esc(it.id)}">Reading${it.unit ? ` (${esc(it.unit)})` : ''}</label><input id="rv-${esc(it.id)}" data-f="value" value="${esc(it.value)}" inputmode="decimal" enterkeyhint="done" placeholder="${it.unit ? 'e.g. value in ' + esc(it.unit) : 'Value'}" autocomplete="off"></div>` : ''}
+      ${showNote ? `<div class="ii-note"><label for="nt-${esc(it.id)}">${it.result === 'fail' ? 'Deficiency note <span class="req">* required</span>' : 'Note'}</label>
+        <textarea id="nt-${esc(it.id)}" data-f="note" rows="2" placeholder="${it.result === 'fail' ? 'What is wrong / what is needed? e.g. Belt cracked – replace BX-62' : 'Optional note'}">${esc(it.note)}</textarea></div>` : `<button type="button" class="linkbtn ii-addnote" data-note>+ Note</button>`}
+      ${it.result === 'fail' || ph.length ? `<div class="photos ii-ph">${ph.map(x => `<div class="ph"><img alt="Deficiency photo" src="${objURL(x.blob)}"><button type="button" class="x" data-rmph="${esc(x.id)}" aria-label="Remove photo">×</button></div>`).join('')}
+        <label class="addph">${ICON.camera}<span>Photo</span><input type="file" accept="image/*" capture="environment" hidden data-addph></label></div>` : ''}
+    </div>`;
+  };
+  view.innerHTML = `
+    <div class="hero insp-hero"><div class="tag">${esc(a.tag)}</div>
+      <div class="meta"><span class="badge">${esc(a.type || '—')}</span>${inspResultPill(insp)}</div>
+      <div class="muted small" style="margin-top:6px">${esc([p.name, locLine(a)].filter(Boolean).join(' · '))}</div>
+      <div class="grid2" style="margin-top:12px">
+        <div class="field" style="margin:0"><label for="iDate">Inspection date</label><input id="iDate" type="date" value="${esc(insp.date)}"></div>
+        <div class="field" style="margin:0"><label for="iBy">Inspector</label><input id="iBy" value="${esc(insp.inspector)}" placeholder="Your name" autocomplete="name"></div>
+      </div></div>
+    <div class="card insp-prog" id="iProg"></div>
+    <div id="iItems">${insp.items.map(itemHtml).join('')}</div>
+    <div class="row"><button class="btn sm" id="iAddItem">+ Add item to this inspection</button></div>
+    <div class="card"><div class="field" style="margin:0"><label for="iNotes">General notes</label><textarea id="iNotes" placeholder="Observations, follow-up, parts used…">${esc(insp.notes)}</textarea></div></div>
+    <p class="muted small" style="text-align:center">Saved automatically as a draft on this device.</p>`;
+  const renderProg = () => {
+    const c = inspCounts(insp), pct = c.reqTotal ? Math.round(100 * c.reqDone / c.reqTotal) : 100;
+    $('#iProg').innerHTML = `<div class="ip-head"><span><b class="ip-n">${c.reqDone}/${c.reqTotal}</b> required complete</span><span class="muted small">${c.answered}/${c.total} items answered${c.fail ? ` · <b class="over-txt">${c.fail} failed</b>` : ''}</span></div>
+      <div class="progress"><span style="width:${pct}%"></span></div>`;
+    const b = $('#iDone'); if (b) { b.innerHTML = `Complete (${c.reqDone}/${c.reqTotal})`; b.classList.toggle('disabled', c.reqDone < c.reqTotal); }
+  };
+  setBottomBar(`<button class="btn" id="iSave">Save draft</button><button class="btn primary" id="iDone">Complete</button>`);
+  renderProg();
+  let timer = null;
+  let chain = Promise.resolve();
+  const persist = () => { clearTimeout(timer); timer = null; const {items, ...rest} = insp; const snap = {...rest, items: items.map(({_noteOpen, ...x}) => ({...x}))};
+    return (chain = chain.then(() => saveInspection(aid, snap)).catch(e => { console.error(e); toast('Save failed: ' + e.message); })); };
+  const later = () => { clearTimeout(timer); timer = setTimeout(() => persist().catch(console.error), 500); };
+  // flush pending edits if the user navigates away mid-typing
+  const flush = () => { if (timer) persist().catch(console.error); window.removeEventListener('hashchange', flush); };
+  window.addEventListener('hashchange', flush);
+  const refreshItem = it => { const el = $(`#ii-${CSS.escape(it.id)}`); if (el) el.outerHTML = itemHtml(it, insp.items.indexOf(it)); };
+  inspPhotos(aid, insp.id).then(ph => { photos = ph; if (ph.length) insp.items.forEach(it => { if (ph.some(x => x.itemId === it.id)) refreshItem(it); }); });
+  const items = $('#iItems');
+  items.onclick = async e => {
+    const card = e.target.closest('.ii'); if (!card) return;
+    const it = insp.items.find(x => x.id === card.dataset.id); if (!it) return;
+    const rb = e.target.closest('[data-r]');
+    if (rb) {
+      const r = rb.dataset.r; it.result = it.result === r ? '' : r;
+      refreshItem(it); renderProg(); await persist();
+      if (it.result === 'fail' && !it.note) { const t = $(`#nt-${CSS.escape(it.id)}`); if (t) t.focus(); }
+      return;
+    }
+    if (e.target.closest('[data-note]')) { it._noteOpen = true; refreshItem(it); const t = $(`#nt-${CSS.escape(it.id)}`); if (t) t.focus(); return; }
+    const rm = e.target.closest('[data-rmph]');
+    if (rm && await confirmBox('Remove photo?', 'This photo will be deleted.', 'Remove', true)) { await Data.deletePhoto(rm.dataset.rmph); photos = photos.filter(x => x.id !== rm.dataset.rmph); refreshItem(it); }
+  };
+  items.oninput = e => {
+    const f = e.target.closest('[data-f]'), card = e.target.closest('.ii'); if (!f || !card) return;
+    const it = insp.items.find(x => x.id === card.dataset.id); if (!it) return;
+    it[f.dataset.f] = f.value; if (f.dataset.f === 'note') renderProg(); later();
+  };
+  items.onchange = async e => {
+    const inp = e.target.closest('[data-addph]'); if (!inp || !inp.files.length) return;
+    const it = insp.items.find(x => x.id === e.target.closest('.ii').dataset.id);
+    toast('Saving photo…');
+    for (const f of inp.files) await addInspPhoto(aid, insp.id, it.id, await resizeImage(f));
+    photos = await inspPhotos(aid, insp.id); refreshItem(it); toast('Photo added');
+  };
+  $('#iDate').onchange = e => { insp.date = e.target.value || today(); later(); };
+  $('#iBy').oninput = e => { insp.inspector = e.target.value; later(); };
+  $('#iNotes').oninput = e => { insp.notes = e.target.value; later(); };
+  $('#iAddItem').onclick = () => {
+    modal({title: 'Add item to this inspection', body: `<div class="field"><label for="aiText">Task</label><input id="aiText" placeholder="e.g. Check VFD fault history"></div>
+      <label class="chk"><input type="checkbox" id="aiReq" checked> Required</label>
+      <div class="field" style="margin-top:8px"><label for="aiUnit">Reading unit <span class="muted">(optional – leave blank for no reading)</span></label><input id="aiUnit" placeholder="e.g. A, °F, psi"></div>
+      <p class="muted small">Only added to this inspection. To add it every time, use <b>Checklist &amp; schedule</b> on the asset.</p>`,
+      onOpen: d => $('#aiText', d).focus(),
+      actions: [{label: 'Cancel'}, {label: 'Add', cls: 'primary', onClick: async d => {
+        const text = $('#aiText', d).value.trim(); if (!text) { toast('Enter the task'); return false; }
+        const it = normItem({text, required: $('#aiReq', d).checked, unit: $('#aiUnit', d).value, extra: 'adhoc'}, true); it.extra = 'adhoc';
+        insp.items.push(it); items.insertAdjacentHTML('beforeend', itemHtml(it, insp.items.length - 1)); renderProg(); await persist();
+        $(`#ii-${CSS.escape(it.id)}`).scrollIntoView({block: 'center'});
+      }}]});
+  };
+  $('#iMenu').onclick = () => {
+    const m = modal({title: 'Inspection', body: `<div class="menu">
+      <button class="btn" data-m="all">✓ Mark all unchecked items Done</button>
+      <button class="btn" data-m="report">🖨️ Preview report</button>
+      <button class="btn danger" data-m="del">🗑️ Delete this draft</button></div>`});
+    m.el.addEventListener('click', async e => {
+      const b = e.target.closest('[data-m]'); if (!b) return; m.close();
+      if (b.dataset.m === 'all') {
+        const n = insp.items.filter(x => !x.result).length; if (!n) return toast('Every item already has a result');
+        if (!await confirmBox('Mark all Done?', `Sets the ${n} item${n === 1 ? '' : 's'} with no result to <b>Done</b>. Only do this if you actually checked them.`, 'Mark Done')) return;
+        insp.items.forEach(x => { if (!x.result) x.result = 'done'; }); await persist(); route();
+      }
+      if (b.dataset.m === 'report') { await persist(); go(`${back}/i/${encodeURIComponent(insp.id)}?report=1`); }
+      if (b.dataset.m === 'del' && await confirmBox('Delete draft inspection?', 'All results, notes and photos in this draft will be deleted.', 'Delete', true)) {
+        clearTimeout(timer); timer = null; await deleteInspection(aid, insp.id); toast('Draft deleted'); go(back);
+      }
+    });
+  };
+  $('#iSave').onclick = async () => { await persist(); toast('Draft saved'); };
+  $('#iDone').onclick = async () => {
+    await persist();
+    const c = inspCounts(insp);
+    if (c.reqLeft.length || c.failNoNote.length) {
+      const li = it => `<li><button type="button" class="linkbtn" data-goto="${esc(it.id)}">${insp.items.indexOf(it) + 1}. ${esc(it.text)}</button></li>`;
+      const m = modal({title: "Can't complete yet", body: `<p class="small" style="margin-top:0">Every required item must be <b>Done</b>, <b>N/A</b>, or <b>Fail</b> with a note.</p>
+        ${c.reqLeft.length ? `<div class="lbl">Still to check (${c.reqLeft.length})</div><ul class="left-list">${c.reqLeft.map(li).join('')}</ul>` : ''}
+        ${c.failNoNote.length ? `<div class="lbl">Failed – add a deficiency note (${c.failNoNote.length})</div><ul class="left-list">${c.failNoNote.map(li).join('')}</ul>` : ''}`,
+        actions: [{label: 'OK', cls: 'primary'}]});
+      m.el.id = 'blockDlg';
+      m.el.addEventListener('click', e => { const b = e.target.closest('[data-goto]'); if (!b) return; m.close();
+        const el = $(`#ii-${CSS.escape(b.dataset.goto)}`); if (el) { el.scrollIntoView({block: 'center'}); el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 1600); } });
+      return;
+    }
+    signOffDialog(p, a, insp, async () => { clearTimeout(timer); timer = null; });
+  };
+}
+function signOffDialog(p, a, insp, beforeSave) {
+  const c = inspCounts(insp), skipped = insp.items.filter(x => !x.result).length, result = c.fail ? 'Passed with deficiencies' : 'Passed';
+  let drawn = false;
+  const m = modal({title: 'Sign off & complete', body: `
+    <div class="so-sum"><span class="pill ${inspResultCls(result)}">${esc(result)}</span>
+      <span class="small">${c.done} done · ${c.na} N/A · ${c.fail} failed${skipped ? ` · ${skipped} optional not checked` : ''}</span></div>
+    <div class="field" style="margin-top:12px"><label for="soName">Inspector name <span class="req">*</span></label><input id="soName" value="${esc(insp.inspector)}" autocomplete="name"></div>
+    <div class="field"><label>Signature <span class="muted">(optional – draw with your finger)</span></label>
+      <canvas id="soSig" class="sig-pad" width="600" height="200" aria-label="Signature pad"></canvas>
+      <button type="button" class="linkbtn" id="soClear">Clear signature</button></div>
+    <p class="muted small">Completing locks the results. You can reopen it later if something needs correcting.</p>`,
+    actions: [{label: 'Cancel'}, {label: '✓ Sign &amp; complete', cls: 'primary', onClick: async d => {
+      const name = $('#soName', d).value.trim(); if (!name) { toast('Enter the inspector name'); $('#soName', d).focus(); return false; }
+      await beforeSave();
+      const fresh = await Data.asset(a.id); const cur = fresh && (fresh.inspections || []).find(x => x.id === insp.id) || insp;
+      Object.assign(cur, {inspector: name, signedName: name, signature: drawn ? $('#soSig', d).toDataURL('image/png') : '', status: 'complete', completedAt: nowISO()});
+      localStorage.setItem(LSK('at-inspector'), name);
+      await saveInspection(a.id, cur);
+      toast(`${a.tag}: inspection complete – ${result}`, 3000);
+      const dest = `${inspBase(p.id, a.id)}/i/${encodeURIComponent(insp.id)}`;
+      if (location.hash === '#' + dest) route(); else go(dest, true);
+    }}]});
+  m.el.id = 'signDlg';
+  const cv = $('#soSig', m.el), g = cv.getContext('2d'); g.lineWidth = 3.2; g.lineCap = g.lineJoin = 'round'; g.strokeStyle = '#13202d';
+  let down = false;
+  const pt = e => { const r = cv.getBoundingClientRect(); return [(e.clientX - r.left) * cv.width / r.width, (e.clientY - r.top) * cv.height / r.height]; };
+  cv.onpointerdown = e => { down = true; cv.setPointerCapture(e.pointerId); g.beginPath(); g.moveTo(...pt(e)); e.preventDefault(); };
+  cv.onpointermove = e => { if (!down) return; g.lineTo(...pt(e)); g.stroke(); drawn = true; e.preventDefault(); };
+  cv.onpointerup = cv.onpointercancel = () => { down = false; };
+  $('#soClear', m.el).onclick = () => { g.clearRect(0, 0, cv.width, cv.height); drawn = false; };
+}
+
+function inspText(p, a, insp) {
+  const c = inspCounts(insp), r = inspResult(insp), loc = plainLoc(a);
+  const subject = `Inspection ${insp.status === 'complete' ? 'report' : '(in progress)'}: ${a.tag}${a.type ? ' (' + a.type + ')' : ''} – ${fmtDate(insp.date)} – ${r}`;
+  const L = [`${p.name}`, `${a.tag}${a.type ? ' (' + a.type + ')' : ''}${loc ? ' - ' + loc : ''}`];
+  const mm = [a.manufacturer, a.model && 'Model ' + a.model, a.serial && 'S/N ' + a.serial].filter(Boolean).join(', '); if (mm) L.push(mm);
+  L.push('', `Date: ${fmtDate(insp.date)}`, `Inspector: ${insp.inspector || '-'}`, `Result: ${r}`, `Items: ${c.done} done, ${c.na} N/A, ${c.fail} failed${c.total - c.answered ? `, ${c.total - c.answered} not checked` : ''}`);
+  const fails = insp.items.filter(x => x.result === 'fail');
+  if (fails.length) { L.push('', `DEFICIENCIES (${fails.length}):`); fails.forEach(x => L.push(`- ${x.text}${x.value ? ` [${x.value}${x.unit ? ' ' + x.unit : ''}]` : ''}: ${x.note || '(no note)'}${x.resolvedAt ? ` (resolved ${fmtDate(x.resolvedAt)})` : ''}`)); }
+  const reads = insp.items.filter(x => x.reading && x.value);
+  if (reads.length) { L.push('', 'READINGS:'); reads.forEach(x => L.push(`- ${x.text}: ${x.value}${x.unit ? ' ' + x.unit : ''}`)); }
+  L.push('', 'CHECKLIST:'); insp.items.forEach((x, i) => L.push(`${i + 1}. [${RES_LABEL[x.result || '']}] ${x.text}${x.value ? ` - ${x.value}${x.unit ? ' ' + x.unit : ''}` : ''}${x.note && x.result !== 'fail' ? ` - ${x.note}` : ''}`));
+  if (insp.notes) L.push('', 'NOTES:', insp.notes);
+  if (insp.status === 'complete') L.push('', `Signed off by ${insp.signedName || insp.inspector || '-'}${insp.completedAt ? ' on ' + new Date(insp.completedAt).toLocaleString() : ''}.`);
+  const text = L.join('\n');
+  let body = L.join('\r\n'); const mk = b => buildMailto([], subject, b);
+  if (mk(body).length > MAILTO_MAX) { while (L.length > 8 && mk(L.join('\r\n') + '\r\n...').length > MAILTO_MAX) L.pop(); body = L.join('\r\n') + '\r\n...(shortened – print the full report to PDF and attach it)'; }
+  return {subject, text, mailto: mk(body)};
+}
+function shareInspDialog(p, a, insp) {
+  const t = inspText(p, a, insp);
+  const m = modal({title: 'Share inspection summary', body: `<pre class="share-pre">${esc(t.text)}</pre>
+    <p class="muted small">“Email” opens your mail app with this summary – add recipients there. For a formatted copy, use <b>Report</b> → Print → Save as PDF.</p>`,
+    actions: [...(navigator.share ? [{label: 'Share…', onClick: async () => { try { await navigator.share({title: t.subject, text: t.text}); } catch (e) { if (e.name !== 'AbortError') toast('Share failed'); } }}] : []),
+      {label: 'Copy', onClick: async () => { toast(await copyText(t.subject + '\n\n' + t.text) ? 'Summary copied' : 'Copy failed'); }},
+      {label: '✉️ Email', cls: 'primary', onClick: () => { location.href = t.mailto; }}]});
+  m.el.id = 'shareDlg';
+}
+async function renderInspView(p, a, insp) {
+  const pid = p.id, aid = a.id, back = inspBase(pid, aid), c = inspCounts(insp), r = inspResult(insp);
+  setChrome(`${a.tag} inspection`, back, `<button class="icon-btn" id="iMenu" aria-label="Inspection menu">${ICON.more}</button>`);
+  const photos = await inspPhotos(aid, insp.id);
+  const phs = it => { const l = photos.filter(x => x.itemId === it.id); return l.length ? `<div class="photos ii-ph">${l.map(x => `<button class="ph" data-ph="${esc(x.id)}"><img alt="Deficiency photo" src="${objURL(x.blob)}"></button>`).join('')}</div>` : ''; };
+  const fails = insp.items.filter(x => x.result === 'fail');
+  view.innerHTML = `
+    <div class="hero insp-hero"><div class="tag">${esc(a.tag)}</div>
+      <div class="meta"><span class="badge">${esc(a.type || '—')}</span>${inspResultPill(insp)}</div>
+      <dl class="kv" style="margin-top:10px"><dt>Date</dt><dd>${esc(fmtDate(insp.date))}</dd><dt>Inspector</dt><dd>${esc(insp.inspector || '—')}</dd>
+        <dt>Completed</dt><dd>${esc(insp.completedAt ? new Date(insp.completedAt).toLocaleString() : '—')}</dd><dt>Project</dt><dd>${esc(p.name)}</dd></dl></div>
+    <div class="due-summary"><div><span class="n">${c.done}</span> done</div><div><span class="n">${c.na}</span> N/A</div><div class="${c.fail ? 'over-txt' : ''}"><span class="n">${c.fail}</span> failed</div>${c.total - c.answered ? `<div><span class="n">${c.total - c.answered}</span> not checked</div>` : ''}</div>
+    ${fails.length ? `<div class="card def-card"><div class="lbl over-txt">Deficiencies (${fails.length}${c.open !== fails.length ? `, ${c.open} open` : ''})</div>
+      ${fails.map(it => `<div class="def-row ${it.resolvedAt ? 'resolved' : ''}"><div class="main"><b>${esc(it.text)}</b>${it.value ? ` <span class="badge">${esc(it.value)}${it.unit ? ' ' + esc(it.unit) : ''}</span>` : ''}
+        <div class="def-note">${esc(it.note)}</div>${phs(it)}
+        <div class="small ${it.resolvedAt ? '' : 'over-txt'}">${it.resolvedAt ? `✓ Resolved ${esc(fmtDate(it.resolvedAt))}` : 'Open'}</div></div>
+        <button class="btn sm" data-res="${esc(it.id)}">${it.resolvedAt ? 'Reopen' : '✓ Resolved'}</button></div>`).join('')}</div>` : ''}
+    <div class="card"><div class="lbl">Checklist (${c.total})</div><ul class="ck-list">${insp.items.map((it, i) => `<li class="r-${it.result || 'none'}"><span class="ck-ico">${RES_ICON[it.result || '']}</span>
+      <div class="main"><div>${i + 1}. ${esc(it.text)}${it.required ? '' : ' <span class="muted small">(optional)</span>'}</div>
+      ${it.value ? `<div class="small"><b>${esc(it.value)}${it.unit ? ' ' + esc(it.unit) : ''}</b></div>` : ''}${it.note && it.result !== 'fail' ? `<div class="small muted">${esc(it.note)}</div>` : ''}${it.result !== 'fail' ? phs(it) : ''}</div></li>`).join('')}</ul></div>
+    ${insp.notes ? `<div class="card"><div class="lbl">Notes</div><div style="white-space:pre-wrap">${esc(insp.notes)}</div></div>` : ''}
+    <div class="card"><div class="lbl">Sign-off</div><p style="margin:4px 0">${esc(insp.signedName || insp.inspector || '—')}</p>${insp.signature ? `<img class="sig-img" src="${esc(insp.signature)}" alt="Signature">` : '<p class="muted small" style="margin:0">No signature drawn.</p>'}</div>`;
+  setBottomBar(`<a class="btn" id="iReport" href="${inspHref(pid, aid, insp.id, '?report=1')}">${ICON.print} Report</a><button class="btn primary" id="iShare">✉️ Share / email</button>`);
+  $('#iShare').onclick = () => shareInspDialog(p, a, insp);
+  view.onclick = async e => {
+    const ph = e.target.closest('[data-ph]');
+    if (ph) { const x = photos.find(y => y.id === ph.dataset.ph); if (x) modal({title: 'Deficiency photo', wide: true, body: `<img class="photo-full" src="${objURL(x.blob)}" alt="Photo">`, actions: [{label: 'Download', onClick: () => downloadBlob(x.blob, `${slug(a.tag)}_deficiency_${x.id.slice(0, 6)}.jpg`)}]}); return; }
+    const b = e.target.closest('[data-res]'); if (!b) return;
+    const it = insp.items.find(x => x.id === b.dataset.res); if (!it) return;
+    it.resolvedAt = it.resolvedAt ? '' : today(); await saveInspection(aid, insp);
+    toast(it.resolvedAt ? 'Deficiency marked resolved' : 'Deficiency reopened'); route();
+  };
+  $('#iMenu').onclick = () => {
+    const m = modal({title: 'Inspection', body: `<div class="menu">
+      <button class="btn" data-m="report">🖨️ Printable report / PDF</button>
+      <button class="btn" data-m="share">✉️ Share / email summary</button>
+      <button class="btn" data-m="reopen">✏️ Reopen to edit</button>
+      <button class="btn danger" data-m="del">🗑️ Delete inspection</button></div>`});
+    m.el.addEventListener('click', async e => {
+      const b = e.target.closest('[data-m]'); if (!b) return; m.close();
+      const k = b.dataset.m;
+      if (k === 'report') go(`${back}/i/${encodeURIComponent(insp.id)}?report=1`);
+      if (k === 'share') shareInspDialog(p, a, insp);
+      if (k === 'reopen' && await confirmBox('Reopen inspection?', 'It goes back to draft so results can be changed. Sign off again to complete it.', 'Reopen')) {
+        insp.status = 'draft'; insp.completedAt = ''; await saveInspection(aid, insp); route();
+      }
+      if (k === 'del' && await confirmBox('Delete inspection?', `Permanently delete the ${esc(fmtDate(insp.date))} inspection of ${esc(a.tag)} and its photos?`, 'Delete', true)) {
+        await deleteInspection(aid, insp.id); toast('Inspection deleted'); go(back);
+      }
+    });
+  };
+}
+async function renderInspReport(p, a, insp) {
+  const pid = p.id, aid = a.id, c = inspCounts(insp), r = inspResult(insp);
+  setChrome(`Report – ${a.tag}`, `${inspBase(pid, aid)}/i/${encodeURIComponent(insp.id)}`);
+  const photos = await inspPhotos(aid, insp.id);
+  const kv = (k, v) => v ? `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>` : '';
+  const fails = insp.items.filter(x => x.result === 'fail');
+  view.innerHTML = `
+    <div class="row no-print"><button class="btn primary" id="rPrint">${ICON.print} Print / Save as PDF</button><button class="btn" id="rShare">✉️ Share / email text</button></div>
+    ${insp.status !== 'complete' ? '<div class="notice warn">Draft – this inspection has not been signed off yet.</div>' : ''}
+    <article class="report" id="report">
+      <header class="rp-head"><div><div class="rp-title">Equipment Inspection Report</div><div class="rp-sub">${esc(p.name)}${p.client ? ' · ' + esc(p.client) : ''}</div>${p.address ? `<div class="rp-sub">${esc(p.address)}</div>` : ''}</div>
+        <div class="rp-qr">${qrSvg(a.tag)}</div></header>
+      <div class="rp-grid">
+        <table class="rp-kv"><tbody>${kv('Asset tag', a.tag)}${kv('Type', a.type)}${kv('Manufacturer', a.manufacturer)}${kv('Model', a.model)}${kv('Serial', a.serial)}${kv('Capacity', a.capacity)}${kv('Location', plainLoc(a))}</tbody></table>
+        <table class="rp-kv"><tbody>${kv('Inspection date', fmtDate(insp.date))}${kv('Inspector', insp.inspector || '—')}${kv('Status', insp.status === 'complete' ? 'Complete' : 'Draft')}
+          <tr><th>Result</th><td><b class="${c.fail ? 'over-txt' : 'ok-txt'}">${esc(r)}</b></td></tr>${kv('Items', `${c.done} done · ${c.na} N/A · ${c.fail} failed${c.total - c.answered ? ` · ${c.total - c.answered} not checked` : ''}`)}${kv('Next due', inspNextDue(a) ? fmtDate(inspNextDue(a)) : '')}</tbody></table>
+      </div>
+      ${fails.length ? `<h3 class="rp-h over-txt">Deficiencies (${fails.length})</h3><table class="rp-tbl"><thead><tr><th>Item</th><th>Note</th><th>Status</th></tr></thead><tbody>
+        ${fails.map(x => `<tr><td>${esc(x.text)}${x.value ? `<br><b>${esc(x.value)} ${esc(x.unit)}</b>` : ''}</td><td>${esc(x.note)}</td><td>${x.resolvedAt ? 'Resolved ' + esc(fmtDate(x.resolvedAt)) : '<b>Open</b>'}</td></tr>`).join('')}</tbody></table>` : ''}
+      <h3 class="rp-h">Checklist</h3>
+      <table class="rp-tbl"><thead><tr><th>#</th><th>Task</th><th>Result</th><th>Reading</th><th>Note</th></tr></thead><tbody>
+        ${insp.items.map((x, i) => `<tr class="rr-${x.result || 'none'}"><td>${i + 1}</td><td>${esc(x.text)}${x.required ? '' : ' <span class="muted">(opt.)</span>'}</td><td class="rp-res">${esc(RES_LABEL[x.result || ''])}</td><td>${x.value ? esc(x.value) + (x.unit ? ' ' + esc(x.unit) : '') : ''}</td><td>${esc(x.note)}</td></tr>`).join('')}</tbody></table>
+      ${insp.notes ? `<h3 class="rp-h">Notes</h3><p style="white-space:pre-wrap;margin:4px 0">${esc(insp.notes)}</p>` : ''}
+      ${photos.length ? `<h3 class="rp-h">Photos</h3><div class="rp-photos">${photos.map(x => { const it = insp.items.find(y => y.id === x.itemId); return `<figure><img src="${objURL(x.blob)}" alt=""><figcaption>${esc(it ? it.text : '')}</figcaption></figure>`; }).join('')}</div>` : ''}
+      <div class="rp-sign"><div><div class="rp-sl">Inspector</div><div class="rp-sv">${esc(insp.signedName || insp.inspector || '')}</div></div>
+        <div><div class="rp-sl">Signature</div>${insp.signature ? `<img src="${esc(insp.signature)}" alt="Signature">` : '<div class="rp-line"></div>'}</div>
+        <div><div class="rp-sl">Date</div><div class="rp-sv">${esc(insp.completedAt ? new Date(insp.completedAt).toLocaleDateString('en-US', {month: 'short', day: 'numeric', year: 'numeric'}) : '')}</div></div></div>
+      <footer class="rp-foot">Generated by Asset Tagger · ${esc(new Date().toLocaleString())}</footer>
+    </article>`;
+  $('#rPrint').onclick = () => window.print();
+  $('#rShare').onclick = () => shareInspDialog(p, a, insp);
+}
+
+/* ---- Project "Inspections" screen ---- */
+function inspBuckets(assets, t = today()) {
+  const mk = t.slice(0, 7), b = {overdue: [], this: [], next: [], never: [], draft: [], doneMonth: [], defs: []};
+  assets.forEach(a => {
+    const st = inspDueStatus(a, t);
+    if (st.key === 'overdue') b.overdue.push(a); else if (st.key === 'this') b.this.push(a); else if (st.key === 'next') b.next.push(a); else if (st.key === 'never') b.never.push(a);
+    inspList(a).forEach(i => {
+      if (i.status !== 'complete') b.draft.push({a, i});
+      else {
+        if (String(i.date).slice(0, 7) === mk) b.doneMonth.push({a, i});
+        (i.items || []).forEach(it => { if (it.result === 'fail' && !it.resolvedAt) b.defs.push({a, i, it}); });
+      }
+    });
+  });
+  const byTag = (x, y) => natCmp((x.a || x).tag, (y.a || y).tag);
+  b.overdue.sort((x, y) => natCmp(inspNextDue(x), inspNextDue(y)) || byTag(x, y)); b.this.sort((x, y) => natCmp(inspNextDue(x), inspNextDue(y)) || byTag(x, y)); b.next.sort(byTag); b.never.sort(byTag);
+  b.draft.sort(byTag); b.doneMonth.sort((x, y) => natCmp(y.i.date, x.i.date)); b.defs.sort((x, y) => natCmp(y.i.date, x.i.date) || byTag(x, y));
+  return b;
+}
+function inspNoticeHtml(pid, assets) {
+  const b = inspBuckets(assets), bits = [];
+  if (b.overdue.length) bits.push(`<b class="over-txt">${b.overdue.length} overdue</b>`);
+  if (b.this.length) bits.push(`${b.this.length} due this month`);
+  if (b.draft.length) bits.push(`${b.draft.length} in progress`);
+  if (b.defs.length) bits.push(`<b class="over-txt">${defic(b.defs.length)} open</b>`);
+  if (!bits.length) return '';
+  return `<a class="notice insp-notice" href="#/p/${encodeURIComponent(pid)}/inspections"><span class="db-ico">✅</span><span class="db-main"><b>Inspections:</b> ${bits.join(' · ')} <span class="db-cta">›</span></span></a>`;
+}
+async function renderInspections(pid) {
+  const p = await Data.project(pid); if (!p) return go('/', true);
+  const assets = await Data.assets(pid), b = inspBuckets(assets), t = today();
+  setChrome(`Inspections – ${p.name}`, `/p/${encodeURIComponent(pid)}`);
+  const ah = a => assetHref(pid, a);
+  const dueRow = (a, showStart = true) => { const st = inspDueStatus(a, t), nd = inspNextDue(a), l = lastComplete(a);
+    return `<div class="item insp-row"><a class="main" href="${ah(a)}"><div class="t">${esc(a.tag)} <span class="badge">${esc(a.type || '—')}</span></div>
+      <div class="sub">${esc(locLine(a) || a.areaServed || '')}</div>
+      <div class="sub">${nd ? `${st.key === 'overdue' ? '<b class="over-txt">Was due' : 'Due'} ${esc(fmtDate(nd))}${st.key === 'overdue' ? '</b>' : ''}` : 'Never inspected'}${l ? ` · last ${esc(fmtDate(l.date))}` : ''} · ${esc(inspFreqLabel(inspFreqOf(a)).toLowerCase())}</div></a>
+      ${showStart ? `<button class="btn sm" data-start="${esc(a.id)}">${openDraft(a) ? '▶ Continue' : '✓ Start'}</button>` : ''}</div>`; };
+  const inspRow = ({a, i}) => { const c = inspCounts(i);
+    return `<a class="item insp-row" href="${inspHref(pid, a.id, i.id)}"><div class="main"><div class="t">${esc(a.tag)} <span class="badge">${esc(a.type || '—')}</span></div>
+      <div class="sub">${esc(fmtDate(i.date))} · ${esc(i.inspector || 'No inspector')}</div>
+      <div class="sub">${i.status === 'complete' ? `${c.done} done · ${c.na} N/A · ${c.fail} failed` : `${c.answered}/${c.total} answered · ${c.reqDone}/${c.reqTotal} required`}</div></div>
+      <div class="right">${inspResultPill(i)}${c.open ? `<span class="pill pt-pill pt-over">${c.open} open</span>` : ''}</div></a>`; };
+  const defRow = ({a, i, it}) => `<a class="card def-item" href="${inspHref(pid, a.id, i.id)}"><div class="di-head"><b>${esc(a.tag)}</b><span class="badge">${esc(a.type || '—')}</span><span class="muted small">${esc(fmtDate(i.date))}</span><span class="chev">›</span></div>
+    <div class="di-text">✗ ${esc(it.text)}${it.value ? ` <span class="badge">${esc(it.value)} ${esc(it.unit)}</span>` : ''}</div><div class="small">${esc(it.note)}</div></a>`;
+  const sec = (title, arr, fn, cls = '', empty = '') => arr.length ? `<h2 class="${cls}">${title} (${arr.length})</h2><div class="list">${arr.map(fn).join('')}</div>` : (empty ? `<h2>${title} (0)</h2><p class="muted small">${empty}</p>` : '');
+  const scheduled = assets.filter(a => inspFreqOf(a)).length;
+  view.innerHTML = `
+    <div class="insp-stats">
+      <div class="${b.overdue.length ? 'bad' : ''}"><span class="n">${b.overdue.length}</span>Overdue</div>
+      <div><span class="n">${b.this.length}</span>Due this month</div>
+      <div><span class="n">${b.draft.length}</span>In progress</div>
+      <div class="${b.defs.length ? 'bad' : ''}"><span class="n">${b.defs.length}</span>Open deficiencies</div>
+      <div class="good"><span class="n">${b.doneMonth.length}</span>Done ${esc(monthShort(t.slice(0, 7)))}</div>
+    </div>
+    ${!assets.length ? '<div class="empty"><p>No assets in this project yet.</p></div>' : ''}
+    ${sec('Open deficiencies', b.defs, defRow, 'over-txt')}
+    ${sec('In progress', b.draft, inspRow)}
+    ${sec('Overdue', b.overdue, a => dueRow(a), 'over-txt')}
+    ${sec('Due this month', b.this, a => dueRow(a))}
+    ${sec('Due next month', b.next, a => dueRow(a))}
+    ${sec(`Completed in ${esc(monthShort(t.slice(0, 7)))}`, b.doneMonth, inspRow, '', 'No inspections completed this month yet.')}
+    ${b.never.length ? `<details class="filters card"><summary>Never inspected (${b.never.length})</summary><div class="list">${b.never.map(a => dueRow(a)).join('')}</div></details>` : ''}
+    <p class="muted small">${scheduled} of ${assets.length} assets on an inspection schedule. Set the interval per unit on the asset (Checklist &amp; schedule) and default intervals per type in <a href="#/settings/checklists">Settings → Inspection checklists</a>.</p>`;
+  view.onclick = e => { const s = e.target.closest('[data-start]'); if (s) startInspection(pid, s.dataset.start); };
+}
+/* ---- Settings: checklist templates ---- */
+async function renderChecklists() {
+  setChrome('Inspection checklists', '/settings');
+  const st = loadTplStore();
+  view.innerHTML = `<p class="small muted">Default task list used when you tap <b>Start inspection</b> on an asset of each type. Changes apply to new inspections (completed ones keep their own copy).</p>
+    <div class="list">${INSP_TYPES.map(t => { const tp = getTemplate(t), req = tp.items.filter(x => x.required).length;
+      return `<a class="item" href="#/settings/checklists/${encodeURIComponent(t)}"><div class="main"><div class="t">${esc(t)}</div>
+        <div class="sub">${tp.items.length} items · ${req} required · ${esc(inspFreqLabel(tp.freq))}</div></div>
+        <div class="right">${st[t] ? '<span class="badge">Customized</span>' : '<span class="badge opt-b">Default</span>'}</div><span class="chev">›</span></a>`; }).join('')}</div>`;
+}
+async function renderChecklistEdit(type) {
+  if (!INSP_DEFAULTS[type]) return go('/settings/checklists', true);
+  setChrome(`${type} checklist`, '/settings/checklists');
+  const tp = getTemplate(type), items = tp.items.map(x => ({...x}));
+  let dirty = false;
+  view.innerHTML = `
+    <div class="card"><div class="field" style="margin:0"><label for="tFreq">Default inspection interval for ${esc(type)}</label><select id="tFreq">${freqOptions(String(tp.freq), false)}</select></div></div>
+    <div class="card"><div class="lbl">Checklist items</div>
+      <p class="muted small" style="margin:0 0 10px"><b>Required</b> items must be Done, N/A or failed with a note before an inspection can be completed. Tick <b>Reading</b> to ask for a value (amps, temps, pressure).</p>
+      <div id="tItems"></div><button type="button" class="btn sm" id="tAdd">+ Add item</button></div>
+    <div class="row"><button class="btn danger sm" id="tReset">Reset to default</button></div>`;
+  const ed = itemsEditor($('#tItems'), items, () => { dirty = true; });
+  $('#tFreq').onchange = () => { dirty = true; };
+  $('#tAdd').onclick = () => ed.add();
+  setBottomBar(`<button class="btn" id="tCancel">Cancel</button><button class="btn primary" id="tSave">Save checklist</button>`);
+  $('#tCancel').onclick = async () => { if (!dirty || await confirmBox('Discard changes?', 'Your edits to this checklist will be lost.', 'Discard', true)) go('/settings/checklists'); };
+  $('#tSave').onclick = () => {
+    const clean = items.map(x => normItem(x)).filter(x => x.text);
+    if (!clean.length) { toast('Add at least one item'); return; }
+    const s = loadTplStore(); s[type] = {freq: +$('#tFreq').value, items: clean, updatedAt: nowISO()}; saveTplStore(s);
+    toast(`${type} checklist saved`); go('/settings/checklists');
+  };
+  $('#tReset').onclick = async () => {
+    if (!await confirmBox('Reset to default?', `Replaces the ${esc(type)} checklist with the built-in default list.`, 'Reset', true)) return;
+    const s = loadTplStore(); delete s[type]; saveTplStore(s); toast('Reset to default'); route();
+  };
+}
+/* ---- Export rows ---- */
+const INSP_HEADERS = ['Project', 'Asset Tag', 'Equipment Type', 'Building', 'Floor', 'Room / Location', 'Inspection Date', 'Inspector', 'Status', 'Result', 'Items', 'Done', 'N/A', 'Failed', 'Not Checked', 'Open Deficiencies', 'Readings', 'Notes', 'Signed By', 'Signature', 'Completed At', 'Inspection ID'];
+const INSP_ITEM_HEADERS = ['Project', 'Asset Tag', 'Equipment Type', 'Inspection Date', 'Inspector', 'Inspection Status', '#', 'Item', 'Required', 'Result', 'Reading', 'Unit', 'Note', 'Photos', 'Deficiency Status', 'Inspection ID'];
+function inspRows(project, assets, phCount = {}) {
+  const ins = [], items = [];
+  assets.slice().sort((a, b) => natCmp(a.tag, b.tag)).forEach(a => inspList(a).slice().reverse().forEach(i => {
+    const c = inspCounts(i), base = {'Project': project.name, 'Asset Tag': a.tag || '', 'Equipment Type': a.type || ''};
+    ins.push({...base, 'Building': a.building || '', 'Floor': a.floor || '', 'Room / Location': a.room || '', 'Inspection Date': i.date || '', 'Inspector': i.inspector || '',
+      'Status': i.status === 'complete' ? 'Complete' : 'Draft', 'Result': inspResult(i), 'Items': c.total, 'Done': c.done, 'N/A': c.na, 'Failed': c.fail, 'Not Checked': c.total - c.answered,
+      'Open Deficiencies': c.open, 'Readings': (i.items || []).filter(x => x.value).map(x => `${x.text}: ${x.value}${x.unit ? ' ' + x.unit : ''}`).join('; '), 'Notes': i.notes || '',
+      'Signed By': i.status === 'complete' ? (i.signedName || i.inspector || '') : '', 'Signature': i.signature ? 'Yes' : 'No', 'Completed At': i.completedAt ? new Date(i.completedAt).toLocaleString() : '', 'Inspection ID': i.id});
+    (i.items || []).forEach((x, n) => items.push({...base, 'Inspection Date': i.date || '', 'Inspector': i.inspector || '', 'Inspection Status': i.status === 'complete' ? 'Complete' : 'Draft', '#': n + 1,
+      'Item': x.text, 'Required': x.required ? 'Yes' : 'No', 'Result': RES_LABEL[x.result || ''], 'Reading': x.value || '', 'Unit': x.unit || '', 'Note': x.note || '', 'Photos': phCount[i.id + '|' + x.id] || 0,
+      'Deficiency Status': x.result === 'fail' ? (x.resolvedAt ? `Resolved ${x.resolvedAt}` : 'Open') : '', 'Inspection ID': i.id}));
+  }));
+  return {ins, items};
+}
+
+/* Demo inspections – built relative to today so due / overdue / "this month" always look right. */
+function demoInspections(assets, t) {
+  const day = +t.slice(8, 10), mk = t.slice(0, 7);
+  const inMonth = back => `${mk}-${String(Math.max(1, day - back)).padStart(2, '0')}`;
+  const val = it => { const s = it.text.toLowerCase();
+    if (it.unit === '°F') return /condenser water/.test(s) ? '85.1' : /chilled water/.test(s) ? '44.2' : /supply water/.test(s) ? '162' : /space/.test(s) ? '72.4' : /leaving water/.test(s) ? '84.6' : /secondary/.test(s) ? '140' : /primary/.test(s) ? '180 / 150' : '55.6';
+    return {A: '18.4', psig: /condenser/.test(s) ? '128' : '62', psi: /system/.test(s) ? '14' : '8.5', CFM: '640', 'in. w.c.': '3.5'}[it.unit] || '1'; };
+  const stamp = d => new Date(d + 'T15:30:00').toISOString();
+  const mkI = (tag, pid, date, o = {}) => {
+    const a = assets.find(x => x.tag === tag && x.projectId === pid); if (!a) return;
+    const tpl = getTemplate(a.type), items = tpl.items.map((x, n) => {
+      const it = normItem({...x, id: `demo-i-${slug(tag).toLowerCase()}-${date}-${n}`}, true);
+      const ans = o.answered == null || n < o.answered;
+      if (ans) { it.result = (o.fail && o.fail[n]) ? 'fail' : (o.na || []).includes(n) ? 'na' : 'done';
+        if (it.reading && it.result === 'done') it.value = (o.vals && o.vals[n]) || val(it);
+        if (o.fail && o.fail[n]) { it.note = o.fail[n]; if (it.reading) it.value = (o.vals && o.vals[n]) || val(it); } }
+      return it; });
+    const done = o.status !== 'draft';
+    (a.inspections = a.inspections || []).push({id: `demo-insp-${slug(tag).toLowerCase()}-${date}`, date, inspector: o.by || 'J. Rivera (demo)', status: done ? 'complete' : 'draft', items, notes: o.notes || '',
+      signature: '', signedName: done ? (o.by || 'J. Rivera (demo)') : '', startedAt: stamp(date), completedAt: done ? stamp(date) : '', template: tplType(a.type), updatedAt: stamp(date)});
+  };
+  const P1 = 'demo-mob', P2 = 'demo-school';
+  mkI('AHU-1', P1, addMonths(t, -4), {notes: 'Quarterly PM. All good.'});
+  mkI('AHU-1', P1, addMonths(t, -1), {notes: 'Quarterly PM. Pre-filters changed.'});
+  mkI('AHU-3', P1, inMonth(3), {fail: {1: 'Both BX-55 belts glazed and cracked – replace (2 needed).', 4: 'Drain pan rusted, standing water; condensate trap partly clogged. Cleared trap, pan needs coating or replacement.'},
+    notes: 'Existing 23-year-old unit. Recommend budgeting for replacement.'});
+  mkI('CH-2', P1, addMonths(t, -2), {by: 'A. Sample (demo)', fail: {4: 'Condenser pressure high (see reading); compressor 2 tripped on high pressure during test. Service tech scheduled.'}, vals: {4: '182'}});
+  mkI('CH-1', P1, addMonths(t, -3), {by: 'A. Sample (demo)'});
+  mkI('B-1', P1, addMonths(t, -2), {notes: 'Combustion looks good.'});
+  mkI('CT-1', P1, addMonths(t, -2));
+  mkI('RTU-1', P1, addMonths(t, -4), {notes: 'Spring PM.'});
+  mkI('EF-1', P1, inMonth(6), {na: [0]});
+  mkI('CHWP-1', P1, addMonths(t, -5));
+  mkI('AHU-2', P1, t, {status: 'draft', answered: 6, notes: ''});
+  [1, 2, 3].forEach(i => mkI(`RTU-${i}`, P2, inMonth(i), {by: 'A. Sample (demo)'}));
+}
+
 /* ---------------- router ---------------- */
 const view = $('#view');
 const go = (h, replace) => { if (replace) location.replace('#' + h); else location.hash = h; };
@@ -732,6 +1388,7 @@ async function route() {
   const {parts, q} = parseHash();
   try {
     if (!parts.length) return await renderHome();
+    if (parts[0] === 'settings' && parts[1] === 'checklists') return parts[2] ? await renderChecklistEdit(parts[2]) : await renderChecklists();
     if (parts[0] === 'settings') return await renderSettings();
     if (parts[0] === 'parts') return await renderParts(null, q);
     if (parts[0] === 'find') return await handleScan(q.get('tag') || '', q.get('p'), true);
@@ -742,6 +1399,8 @@ async function route() {
       if (parts[2] === 'parts') return await renderParts(pid, q);
       if (parts[2] === 'tree') return await renderTree(pid, q);
       if (parts[2] === 'panels') return await renderPanels(pid, q);
+      if (parts[2] === 'inspections') return await renderInspections(pid);
+      if (parts[2] === 'a' && parts[3] && parts[4] === 'i' && parts[5]) return await renderInspection(pid, parts[3], parts[5], q);
       if (parts[2] === 'a' && parts[3] === 'new') return await renderAssetForm(pid, null, q);
       if (parts[2] === 'a' && parts[3] && parts[4] === 'edit') return await renderAssetForm(pid, parts[3], q);
       if (parts[2] === 'a' && parts[3]) return await renderAsset(pid, parts[3]);
@@ -843,6 +1502,7 @@ async function renderProject(pid) {
   const pnls = panelsOf(assets), pars = parentsOf(assets);
   view.innerHTML = `
     ${partsReminders([p], assets).map(reminderHtml).join('')}
+    ${inspNoticeHtml(pid, assets)}
     <div class="chips" id="statusChips"></div>
     <div class="search"><span>${ICON.search}</span><input id="q" type="search" placeholder="Search tag, model, serial, room, panel…" value="${esc(f.q)}" autocomplete="off" enterkeyhint="search"></div>
     <details class="filters" ${anyAdv ? 'open' : ''}><summary>Filters &amp; sort</summary>
@@ -856,7 +1516,7 @@ async function renderProject(pid) {
       </div></details>
     <div class="resultbar"><span id="count"></span><button class="linkbtn" id="clearF">Clear filters</button></div>
     <div class="list" id="assetList"></div>
-    <div class="row no-print"><button class="btn sm" id="bExport">Export</button><button class="btn sm" id="bImport">Import</button><button class="btn sm" id="bLabels">${ICON.print} Labels</button><button class="btn sm" id="bParts">🔧 Parts due</button><button class="btn sm" id="bTree">🌳 System tree</button><button class="btn sm" id="bPanels">⚡ By panel</button></div>`;
+    <div class="row no-print"><button class="btn sm" id="bExport">Export</button><button class="btn sm" id="bImport">Import</button><button class="btn sm" id="bLabels">${ICON.print} Labels</button><button class="btn sm" id="bInsp">✅ Inspections</button><button class="btn sm" id="bParts">🔧 Parts due</button><button class="btn sm" id="bTree">🌳 System tree</button><button class="btn sm" id="bPanels">⚡ By panel</button></div>`;
   setBottomBar(`<button class="btn" id="bScan">${ICON.scan} Scan</button><button class="btn primary" id="bAdd">${ICON.plus} Add asset</button>`);
 
   const renderList = () => {
@@ -873,8 +1533,8 @@ async function renderProject(pid) {
       : list.map(a => `<a class="item" href="#/p/${encodeURIComponent(pid)}/a/${encodeURIComponent(a.id)}"><div class="main">
           <div class="t">${esc(a.tag)}</div>
           <div class="sub">${esc([a.manufacturer, a.model, a.capacity].filter(Boolean).join(' · ') || '—')}</div>
-          <div class="sub">${esc(locLine(a) || a.areaServed || '')}${pc[a.id] ? ` · 📷 ${pc[a.id]}` : ''}</div>${relSub(a) ? `<div class="sub rel-sub">${esc(relSub(a))}</div>` : ''}</div>
-          <div class="right"><span class="badge">${esc(a.type || '—')}</span>${statusPill(a.status)}${lifePill(a)}${partsPill(a)}</div></a>`).join('');
+          <div class="sub">${esc(locLine(a) || a.areaServed || '')}${pc[a.id] ? ` · 📷 ${pc[a.id]}` : ''}</div>${relSub(a) ? `<div class="sub rel-sub">${esc(relSub(a))}</div>` : ''}${inspLine(a) ? `<div class="sub insp-sub">✓ ${esc(inspLine(a))}</div>` : ''}</div>
+          <div class="right"><span class="badge">${esc(a.type || '—')}</span>${statusPill(a.status)}${lifePill(a)}${partsPill(a)}${inspPill(a)}</div></a>`).join('');
   };
   renderList();
   $('#statusChips').onclick = e => { const c = e.target.closest('.chip'); if (c) { f.status = c.dataset.s; renderList(); } };
@@ -892,6 +1552,7 @@ async function renderProject(pid) {
   $('#bImport').onclick = () => importDialog(p, assets);
   $('#bLabels').onclick = () => go(`/p/${encodeURIComponent(pid)}/labels?filtered=1`);
   $('#bParts').onclick = () => go(`/p/${encodeURIComponent(pid)}/parts`);
+  $('#bInsp').onclick = () => go(`/p/${encodeURIComponent(pid)}/inspections`);
   $('#bTree').onclick = () => go(`/p/${encodeURIComponent(pid)}/tree`);
   $('#bPanels').onclick = () => go(`/p/${encodeURIComponent(pid)}/panels`);
   $('#pMenu').onclick = () => {
@@ -900,6 +1561,7 @@ async function renderProject(pid) {
       <button class="btn" data-m="export">⬇️ Export to Excel / CSV</button>
       <button class="btn" data-m="import">⬆️ Import from Excel / CSV</button>
       <button class="btn" data-m="labels">🖨️ Print QR tag labels</button>
+      <button class="btn" data-m="insp">✅ Inspections – due, in progress, deficiencies</button>
       <button class="btn" data-m="parts">🔧 Filters &amp; belts due / email list</button>
       <button class="btn" data-m="tree">🌳 System tree (what feeds what)</button>
       <button class="btn" data-m="panels">⚡ Equipment by electrical panel</button>
@@ -912,6 +1574,7 @@ async function renderProject(pid) {
       if (a === 'import') importDialog(p, assets);
       if (a === 'labels') go(`/p/${encodeURIComponent(pid)}/labels?filtered=1`);
       if (a === 'parts') go(`/p/${encodeURIComponent(pid)}/parts`);
+      if (a === 'insp') go(`/p/${encodeURIComponent(pid)}/inspections`);
       if (a === 'tree') go(`/p/${encodeURIComponent(pid)}/tree`);
       if (a === 'panels') go(`/p/${encodeURIComponent(pid)}/panels`);
       if (a === 'delete' && await confirmBox('Delete project?', `This permanently deletes <b>${esc(p.name)}</b> and all ${assets.length} assets and photos on this device. Export or back up first if you need them.`, 'Delete', true)) {
@@ -948,6 +1611,7 @@ async function renderAsset(pid, aid) {
       <div class="qr-mini" title="QR for ${esc(a.tag)}">${qrSvg(a.tag)}</div></div></div>
     <div class="card"><div class="lbl">Status — tap to update</div><div class="status-pick" id="stPick">${STATUSES.map(s =>
       `<button data-s="${esc(s)}" class="${(a.status || 'Not started') === s ? 'on ' + STATUS_CLASS[s] : ''}">${esc(s)}</button>`).join('')}</div></div>
+    ${inspCardHtml(pid, a)}
     ${relCardHtml(pid, a, relIndex(projAssets))}
     ${lifeCardHtml(a)}
     ${partsCard}
@@ -990,6 +1654,8 @@ async function renderAsset(pid, aid) {
     const r = await markPartReplaced(aid, pt.id);
     if (r) { toast(`Next due ${fmtDate(r.next)}`); route(); }
   };
+  const bis = $('#bInspStart'); if (bis) bis.onclick = () => startInspection(pid, aid);
+  $('#bInspSetup').onclick = () => inspSetupDialog(pid, a);
   $('#bLabel').onclick = () => go(`/p/${encodeURIComponent(pid)}/labels?ids=${encodeURIComponent(aid)}`);
   $('#bDup').onclick = () => go(`/p/${encodeURIComponent(pid)}/a/new?from=${encodeURIComponent(aid)}`);
   $('#bDel').onclick = async () => {
@@ -1119,6 +1785,8 @@ async function renderAssetForm(pid, aid, q) {
     if (from) ['type','manufacturer','model','capacity','building','floor','lifeExpectancy','fedFrom','controlledBy','powerPanel','voltage'].forEach(k => a[k] = from[k] || '');
     if (from) a.tag = nextTag(from.tag);
     if (from) a.parts = assetParts(from).map(pt => ({...pt, id: uid()}));
+    if (from && from.inspFreq !== undefined) a.inspFreq = from.inspFreq;
+    if (from) a.inspExtra = assetExtra(from).map(x => ({...x, id: uid()}));
     if (q.get('tag')) a.tag = normTag(q.get('tag'));
     if (q.get('fed')) a.fedFrom = splitTags(q.get('fed')).join(', ');
     if (!a.type && a.tag) a.type = guessTypeFromTag(a.tag);
@@ -1493,7 +2161,7 @@ async function renderLabels(pid, q) {
 
 /* ---------------- Export / import ---------------- */
 const EXPORT_FIELDS = FIELDS.filter(f => f.export !== false);
-const HEADERS = ['Project', ...EXPORT_FIELDS.flatMap(f => f.key === 'fedFrom' ? [f.label, 'Feeds'] : [f.label]), 'Age', 'Remaining Life', 'Filters & Belts', 'Photos', 'Created', 'Last Updated'];
+const HEADERS = ['Project', ...EXPORT_FIELDS.flatMap(f => f.key === 'fedFrom' ? [f.label, 'Feeds'] : [f.label]), 'Age', 'Remaining Life', 'Filters & Belts', 'Last Inspection', 'Last Inspection Result', 'Next Inspection Due', 'Open Deficiencies', 'Photos', 'Created', 'Last Updated'];
 const partsSummary = a => assetParts(a).map(pt => `${pt.qty}x ${pt.kind} ${pt.size || '(size not set)'} (${freqLabel(pt.freq).toLowerCase()}, next due ${partNextDue(pt) || 'not set'})`).join('; ');
 function assetRows(project, assets, pc, idx) {
   idx = idx || relIndex(assets);
@@ -1505,6 +2173,7 @@ function assetRows(project, assets, pc, idx) {
     r['Age'] = age != null ? age : '';
     r['Remaining Life'] = rem != null ? rem : '';
     r['Filters & Belts'] = partsSummary(a);
+    const li = lastComplete(a); r['Last Inspection'] = li ? li.date : ''; r['Last Inspection Result'] = li ? inspResult(li) : ''; r['Next Inspection Due'] = inspNextDue(a); r['Open Deficiencies'] = openDeficiencies(a) || '';
     r['Photos'] = pc[a.id] || 0;
     r['Created'] = a.createdAt ? new Date(a.createdAt).toLocaleString() : '';
     r['Last Updated'] = a.updatedAt ? new Date(a.updatedAt).toLocaleString() : '';
@@ -1542,8 +2211,17 @@ async function buildExport(project, assets, fmt) {
   TYPES.forEach(t => { const n = assets.filter(a => a.type === t).length; if (n) sum.push([t, n]); });
   sum.push([], ['Assets with Fed From set', assets.filter(a => fedList(a).length).length], ['Assets with a power panel', assets.filter(a => a.powerPanel).length], ['Power panels', panelsOf(assets).join(', ')]);
   sum.push([], ['Filter / belt line items', pRows.length], ['Overdue', pRows.filter(r => r['Due Status'] === 'Overdue').length], ['Due next month', pRows.filter(r => r['Due Status'] === 'Due next month').length]);
+  { const ib = inspBuckets(assets), all = assets.flatMap(inspList);
+    sum.push([], ['Inspections recorded', all.length], ['Completed', all.filter(i => i.status === 'complete').length], ['In progress (draft)', ib.draft.length], ['Open deficiencies', ib.defs.length], ['Inspections overdue', ib.overdue.length], ['Inspections due this month', ib.this.length]); }
   const ws2 = XLSX.utils.aoa_to_sheet(sum); ws2['!cols'] = [{wch: 22}, {wch: 40}];
   XLSX.utils.book_append_sheet(wb, ws2, 'Summary');
+  const phc = {}; (await DB.all('photos')).forEach(ph => { if (ph.inspId) phc[ph.inspId + '|' + ph.itemId] = (phc[ph.inspId + '|' + ph.itemId] || 0) + 1; });
+  const ir = inspRows(project, assets, phc);
+  const wsI = XLSX.utils.json_to_sheet(ir.ins, {header: INSP_HEADERS}); wsI['!cols'] = autoCols(INSP_HEADERS, ir.ins);
+  if (ir.ins.length) wsI['!autofilter'] = {ref: XLSX.utils.encode_range({s: {r: 0, c: 0}, e: {r: ir.ins.length, c: INSP_HEADERS.length - 1}})};
+  const wsII = XLSX.utils.json_to_sheet(ir.items, {header: INSP_ITEM_HEADERS}); wsII['!cols'] = autoCols(INSP_ITEM_HEADERS, ir.items);
+  if (ir.items.length) wsII['!autofilter'] = {ref: XLSX.utils.encode_range({s: {r: 0, c: 0}, e: {r: ir.items.length, c: INSP_ITEM_HEADERS.length - 1}})};
+  XLSX.utils.book_append_sheet(wb, wsI, 'Inspections'); XLSX.utils.book_append_sheet(wb, wsII, 'Inspection Items');
   wb.Props = {Title: `${project.name} – Asset register`, Author: 'Asset Tagger'};
   const out = XLSX.write(wb, {bookType: 'xlsx', type: 'array', compression: true});
   return {blob: new Blob([out], {type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}), name: name + '.xlsx'};
@@ -1553,7 +2231,8 @@ function exportDialog(project, all, filtered) {
   const hasFilter = filtered.length !== all.length;
   modal({title: 'Export assets', body: `
     ${hasFilter ? `<div class="field"><label>Which assets?</label><select id="exScope"><option value="all">All assets (${all.length})</option><option value="filtered">Current filtered list (${filtered.length})</option></select></div>` : `<p>${all.length} asset${all.length === 1 ? '' : 's'} in <b>${esc(project.name)}</b>.</p>`}
-    <div class="field"><label>Format</label><select id="exFmt"><option value="xlsx">Excel (.xlsx) – Assets + Parts sheets</option><option value="csv">CSV (.csv) – assets</option><option value="parts-csv">CSV (.csv) – filters &amp; belts list</option></select></div>
+    <div class="field"><label>Format</label><select id="exFmt"><option value="xlsx">Excel (.xlsx) – all sheets</option><option value="csv">CSV (.csv) – assets</option><option value="parts-csv">CSV (.csv) – filters &amp; belts list</option></select></div>
+    <p class="muted small">Excel sheets: Assets, Parts, Summary, Inspections and Inspection Items (one row per checklist item).</p>
     <p class="muted small">Photos aren't included in spreadsheets (a photo count is). Use Settings → Backup to keep photos.</p>`,
     actions: [
       ...(share ? [{label: 'Share…', onClick: d => doExport(d, true)}] : []),
@@ -1585,7 +2264,7 @@ async function parseImportFile(file) {
     : XLSX.read(buf, {type: 'array', cellDates: true});
   const toRows = n => XLSX.utils.sheet_to_json(wb.Sheets[n], {defval: '', raw: true});
   const partsName = wb.SheetNames.find(n => /^(parts|filters|belts|maintenance parts)\b/i.test(n.trim()));
-  const skip = n => n === partsName || /^(summary|order totals|by equipment)$/i.test(n.trim());
+  const skip = n => n === partsName || /^(summary|order totals|by equipment|inspections|inspection items)$/i.test(n.trim());
   const assetName = wb.SheetNames.find(n => !skip(n) && /asset|equip|schedule/i.test(n)) || wb.SheetNames.find(n => !skip(n));
   let rows = assetName ? toRows(assetName) : [], parts = partsName ? toRows(partsName) : [];
   if (!partsName && rows.length && isPartsHeaders(Object.keys(rows[0]))) { parts = rows; rows = []; } // a parts-only list (e.g. Parts CSV)
@@ -1653,7 +2332,7 @@ function planImport(rows, existing, pid) {
   const headers = rows.length ? Object.keys(rows[0]) : [];
   const hmap = mapHeaders(headers);
   const byTag = new Map(existing.map(a => [normTag(a.tag), a]));
-  const plan = {create: [], update: [], skipped: 0, hmap, unmapped: headers.filter(h => !hmap[h] && !/^(project|photos|created|last updated|remaining life|remaining|filters & belts|feeds)$/i.test(h.trim()))};
+  const plan = {create: [], update: [], skipped: 0, hmap, unmapped: headers.filter(h => !hmap[h] && !/^(project|photos|created|last updated|remaining life|remaining|filters & belts|feeds|last inspection|last inspection result|next inspection due|open deficiencies)$/i.test(h.trim()))};
   const seen = new Map();
   rows.forEach(row => {
     const rec = {};
@@ -1761,9 +2440,12 @@ async function renderSettings() {
   const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
   view.innerHTML = `
     <div class="card"><div class="lbl">On this device</div>
-      <p style="margin:4px 0">${projects.length} projects · ${assets.length} assets · ${photos.length} photos</p>
+      <p style="margin:4px 0">${projects.length} projects · ${assets.length} assets · ${assets.reduce((n, a) => n + inspList(a).length, 0)} inspections · ${photos.length} photos</p>
       <p class="muted small" style="margin:4px 0">${esc(est)}${est ? '<br>' : ''}Storage protection: <b>${persisted ? 'on (browser won\'t auto-clear)' : 'not granted yet'}</b></p>
       ${persisted ? '' : '<button class="btn sm" id="persistBtn">Request storage protection</button>'}</div>
+    <div class="card"><div class="lbl">Inspection checklists</div>
+      <p class="small" style="margin:4px 0 10px">Task lists per equipment type (AHU, chiller, pump…): add, remove or reorder items, mark required / optional, ask for readings, and set the default interval.</p>
+      <a class="btn block" id="setChk" href="#/settings/checklists">✅ Edit inspection checklists</a></div>
     <div class="card"><div class="lbl">Backup (includes photos)</div>
       <p class="small">Saves everything to one <b>.json</b> file you can keep in email / Drive / OneDrive and restore on any device. Do this at the end of each site visit.</p>
       <div class="row">${canShareFiles() ? '<button class="btn" id="bkShare">Share backup…</button>' : ''}<button class="btn primary" id="bkDl">Download backup</button></div>
@@ -1778,8 +2460,9 @@ async function renderSettings() {
   const pb = $('#persistBtn'); if (pb) pb.onclick = async () => { const ok = navigator.storage && navigator.storage.persist ? await navigator.storage.persist() : false; toast(ok ? 'Storage protection on' : 'Browser declined — install to home screen and try again'); route(); };
   const doBackup = async share => {
     toast('Preparing backup…');
-    const out = {app: 'asset-tagger', version: 1, appVersion: APP_VERSION, exportedAt: nowISO(), projects, assets, photos: []};
-    for (const ph of photos) out.photos.push({id: ph.id, assetId: ph.assetId, createdAt: ph.createdAt, type: ph.type, data: await blobToDataURL(ph.blob)});
+    const out = {app: 'asset-tagger', version: 1, appVersion: APP_VERSION, exportedAt: nowISO(), projects, assets, photos: [],
+      settings: {inspTemplates: loadTplStore(), inspector: localStorage.getItem(LSK('at-inspector')) || ''}};
+    for (const ph of photos) out.photos.push({id: ph.id, assetId: ph.assetId, createdAt: ph.createdAt, type: ph.type, ...(ph.inspId ? {inspId: ph.inspId, itemId: ph.itemId} : {}), data: await blobToDataURL(ph.blob)});
     await shareOrDownload(new Blob([JSON.stringify(out)], {type: 'application/json'}), `asset-tagger-backup_${today()}.json`, share);
   };
   $('#bkDl').onclick = () => doBackup(false);
@@ -1792,7 +2475,10 @@ async function renderSettings() {
       if (!await confirmBox('Restore backup?', `${data.projects.length} projects, ${data.assets.length} assets, ${data.photos.length} photos from ${esc(new Date(data.exportedAt).toLocaleString())}.`, 'Restore')) return;
       if (data.projects.length) await DB.put('projects', ...data.projects);
       if (data.assets.length) await DB.put('assets', ...data.assets);
-      for (const ph of data.photos) await DB.put('photos', {id: ph.id, assetId: ph.assetId, createdAt: ph.createdAt, type: ph.type, blob: await dataURLToBlob(ph.data)});
+      for (const ph of data.photos) await DB.put('photos', {id: ph.id, assetId: ph.assetId, createdAt: ph.createdAt, type: ph.type, ...(ph.inspId ? {inspId: ph.inspId, itemId: ph.itemId} : {}), blob: await dataURLToBlob(ph.data)});
+      const st = data.settings || {};
+      if (st.inspTemplates && typeof st.inspTemplates === 'object') saveTplStore({...loadTplStore(), ...st.inspTemplates});
+      if (st.inspector && !localStorage.getItem(LSK('at-inspector'))) localStorage.setItem(LSK('at-inspector'), st.inspector);
       toast('Backup restored'); route();
     } catch (err) { toast('Restore failed: ' + err.message, 4000); }
   };
@@ -1881,6 +2567,7 @@ function demoData() {
     parts: [F(i < 3 ? '16x25x2 MERV 13' : '20x25x2 MERV 13', 4, 3, 3, 1)]});
   A(P2, {tag: 'EF-1', type: 'Exhaust Fan', manufacturer: 'Ventex Fans (sample)', model: 'VX-14K', serial: 'DEMO-S-EF1-3301', capacity: '1,200 CFM', building: 'Main', floor: 'Roof', room: 'Roof – kitchen', areaServed: 'Kitchen hood',
     fedFrom: '', controlledBy: 'Hood control panel', powerPanel: 'RP-1', breaker: '25,27', voltage: '208V/1ph', disconnect: 'At fan', installYear: String(Y - 1), status: 'Installed'});
+  demoInspections(assets, t);
   return {projects, assets};
 }
 function demoNameplate(a) {
@@ -1914,7 +2601,7 @@ async function seedDemo() {
 async function ensureDemo() { if (!DEMO) return; if (!(await DB.all('projects')).length) await seedDemo(); }
 async function resetDemo() {
   if (!DEMO) return;
-  await DB.clear(); ['at-parts-inc', 'at-label-opts'].forEach(k => localStorage.removeItem(LSK(k))); sessionStorage.removeItem(LSK('at-filters'));
+  await DB.clear(); ['at-parts-inc', 'at-label-opts', 'at-insp-tpl', 'at-inspector'].forEach(k => localStorage.removeItem(LSK(k))); sessionStorage.removeItem(LSK('at-filters'));
   Object.keys(filterState).forEach(k => delete filterState[k]);
   await seedDemo();
 }
@@ -1936,6 +2623,7 @@ window.addEventListener('unhandledrejection', e => { const r = e.reason; if (r &
 window.AssetTagger = {Data, DB, buildExport, planImport, parseImportFile, handleScan, normalizeStatus, normalizeType, guessTypeFromTag, nextTag, extractTag, computeAge, computeRemaining, defaultLife, LIFE_DEFAULTS,
   splitTags, fedList, normPanel, relIndex, upstreamPath, renameRefs, powerLine, typeSummary, applyFilter, FIELDS,
   addMonths, normPart, partNextDue, partStatus, partHits, collectParts, partTotals, partsContext, partsEmail, parseEmails, parseFreq, applyPartsImport, buildPartsXlsx, version: APP_VERSION,
+  getTemplate, defaultTemplate, newInspection, inspCounts, inspResult, inspNextDue, inspDueStatus, inspFreqOf, inspBuckets, inspRows, inspText, INSP_DEFAULTS,
   demo: DEMO, dbName: DB_NAME, seedDemo: () => seedDemo(), resetDemo: () => resetDemo()};
 if ('serviceWorker' in navigator && window.isSecureContext && location.protocol !== 'file:') {
   window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js', {scope: './'}).catch(e => console.warn('SW registration failed', e)));

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Asset Tagger – HVAC &amp; mechanical equipment tagging that works offline</title>
-<meta name="description" content="Tag, scan and track HVAC and mechanical equipment from your phone: QR labels, nameplate data, filters and belts, age and remaining life, system relationships, power panels and Excel export. Works offline.">
+<meta name="description" content="Tag, scan and track HVAC and mechanical equipment from your phone: QR labels, nameplate data, inspection checklists, filters and belts, age and remaining life, system relationships, power panels and Excel export. Works offline.">
 <meta name="theme-color" content="#0b5cab">
 <link rel="icon" href="../icons/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="../icons/icon-180.png">
@@ -122,8 +122,20 @@
     <div class="feat-media"><div class="phones two"><figure class="phone "><div class="scr"><img src="img/parts-due.webp" width="600" height="1298" alt="Parts due screen with order totals for November and one overdue item" loading="lazy" decoding="async"></div></figure><figure class="phone "><div class="scr"><img src="img/parts-list.webp" width="600" height="1298" alt="Overdue and due-next-month filters and belts listed by unit" loading="lazy" decoding="async"></div></figure></div></div>
   </div>
 </section>
-<section class="sec" id="systems">
+<section class="sec" id="inspections">
   <div class="wrap feat">
+    <div class="feat-copy">
+      <div class="kicker">Inspection checklists</div>
+      <h2>Check off every task before the inspection is complete</h2>
+      <p>Tap <b>Start inspection</b> on a unit and its checklist comes up – filters, belts, bearings, coils, drain pan, dampers, amps, controls, noise and vibration for an AHU, with matching lists for chillers, boilers, pumps, VAVs, RTUs, cooling towers and the rest. Mark each task <b>Done</b>, <b>N/A</b> or <b>Fail</b>. The inspection can’t be marked complete until every required task is answered, and a failed item needs a note.</p>
+      <ul class="ticks"><li>Progress shown as you go (7/9 required); if you try to complete early, it lists what’s left</li><li>Failures become deficiencies with a note, a photo and a “resolved” check-off</li><li>Readings where they matter – amps, temperatures, pressures</li><li>Sign off with your name (and a finger signature), then print a report, save it as PDF, or email a summary</li><li>Edit the checklists per equipment type in Settings, and add extra items for one unit</li><li>The Inspections screen shows what’s overdue, due this month, in progress and done</li></ul>
+      <div class="who"><span>Service technicians</span><span>Commissioning agents</span><span>Facility managers</span></div>
+    </div>
+    <div class="feat-media"><div class="phones two"><figure class="phone "><div class="scr"><img src="img/inspection-checklist.webp" width="600" height="1298" alt="AHU-2 inspection checklist at 7 of 9 required, with the fan motor amps item failed, a 27.9 A reading and a deficiency note" loading="lazy" decoding="async"></div></figure><figure class="phone "><div class="scr"><img src="img/inspections-due.webp" width="600" height="1298" alt="Inspections screen for the sample project: 2 overdue, 1 due this month, 1 in progress and 3 open deficiencies listed by unit" loading="lazy" decoding="async"></div></figure></div></div>
+  </div>
+</section>
+<section class="sec alt" id="systems">
+  <div class="wrap feat flip">
     <div class="feat-copy">
       <div class="kicker">Relationships &amp; system tree</div>
       <h2>What feeds what – without digging through drawings</h2>
@@ -134,8 +146,8 @@
     <div class="feat-media"><div class="phones two"><figure class="phone "><div class="scr"><img src="img/system-tree.webp" width="600" height="1298" alt="System tree showing the cooling tower, boiler and chiller plant down to VAV boxes" loading="lazy" decoding="async"></div></figure><figure class="phone "><div class="scr"><img src="img/fed-from.webp" width="600" height="1298" alt="VAV-2-4 showing it is fed from AHU-2 and its full system path" loading="lazy" decoding="async"></div></figure></div></div>
   </div>
 </section>
-<section class="sec alt" id="panels">
-  <div class="wrap feat flip">
+<section class="sec" id="panels">
+  <div class="wrap feat">
     <div class="feat-copy">
       <div class="kicker">Power &amp; By panel view</div>
       <h2>Plan a shutdown: see everything on a panel</h2>
@@ -146,8 +158,8 @@
     <div class="feat-media"><div class="phones"><figure class="phone "><div class="scr"><img src="img/by-panel.webp" width="600" height="1298" alt="By panel view listing equipment on panel 2A3 in circuit order" loading="lazy" decoding="async"></div></figure></div></div>
   </div>
 </section>
-<section class="sec" id="search">
-  <div class="wrap feat">
+<section class="sec alt" id="search">
+  <div class="wrap feat flip">
     <div class="feat-copy">
       <div class="kicker">Search &amp; filters</div>
       <h2>Find any unit in seconds</h2>
@@ -158,20 +170,20 @@
     <div class="feat-media"><div class="phones"><figure class="phone "><div class="scr"><img src="img/filter-issues.webp" width="600" height="1298" alt="Equipment list filtered to show the two units with issues" loading="lazy" decoding="async"></div></figure></div></div>
   </div>
 </section>
-<section class="sec alt" id="export">
-  <div class="wrap feat flip">
+<section class="sec" id="export">
+  <div class="wrap feat">
     <div class="feat-copy">
       <div class="kicker">Excel / CSV export &amp; import</div>
       <h2>Hand it over in a spreadsheet</h2>
-      <p>Export the whole project to Excel with an Assets sheet and a Parts sheet, ready for turnover, O&amp;M binders or loading into a maintenance system. Already have an equipment schedule? Import it from Excel or CSV and start tagging.</p>
-      <ul class="ticks"><li>Excel (.xlsx) with Assets and Parts sheets, or CSV</li><li>Includes relationships, power, age and remaining life</li><li>Import from Excel/CSV – column names are matched automatically, with a preview before anything changes</li><li>Full JSON backup and restore, including photos</li></ul>
+      <p>Export the whole project to Excel with Assets, Parts and Inspections sheets, ready for turnover, O&amp;M binders or loading into a maintenance system. Already have an equipment schedule? Import it from Excel or CSV and start tagging.</p>
+      <ul class="ticks"><li>Excel (.xlsx) with Assets, Parts, Inspections and Inspection Items sheets, or CSV</li><li>Includes relationships, power, age and remaining life</li><li>Import from Excel/CSV – column names are matched automatically, with a preview before anything changes</li><li>Full JSON backup and restore, including photos</li></ul>
       <div class="who"><span>Commissioning agents</span><span>Contractors</span><span>Facility managers</span></div>
     </div>
-    <div class="feat-media"><div class="phones"><figure class="phone "><div class="scr"><img src="img/export.webp" width="600" height="1298" alt="Export dialog offering Excel with Assets and Parts sheets or CSV" loading="lazy" decoding="async"></div></figure></div></div>
+    <div class="feat-media"><div class="phones"><figure class="phone "><div class="scr"><img src="img/export.webp" width="600" height="1298" alt="Export dialog offering Excel with Assets, Parts and Inspections sheets or CSV" loading="lazy" decoding="async"></div></figure></div></div>
   </div>
 </section>
-<section class="sec" id="offline">
-  <div class="wrap feat">
+<section class="sec alt" id="offline">
+  <div class="wrap feat flip">
     <div class="feat-copy">
       <div class="kicker">Works offline</div>
       <h2>Built for basements and mechanical rooms</h2>
@@ -183,28 +195,29 @@
   </div>
 </section>
 
-<section class="sec alt" id="how">
+<section class="sec" id="how">
   <div class="wrap">
     <div class="kicker">How it works on the job</div>
-    <h2>Five steps, one phone</h2>
+    <h2>Six steps, one phone</h2>
     <p class="sub">A typical walk-down with Asset Tagger.</p>
     <div class="steps">
       <div class="step"><h3>Tag</h3><p>Create a project for the building. Add each unit by tag – or import the equipment schedule – then print QR labels and stick them on.</p></div>
       <div class="step"><h3>Scan</h3><p>On every visit after that, scan the label to open the unit. No searching through a spreadsheet on a ladder.</p></div>
       <div class="step"><h3>Record</h3><p>Update the status, snap the nameplate, note issues, and fill in what it’s fed from and which panel and breaker power it.</p></div>
+      <div class="step"><h3>Inspect</h3><p>Start an inspection, check off each task on the unit’s checklist, write up anything that fails, and sign off. Print or email the report.</p></div>
       <div class="step"><h3>Track parts</h3><p>Add filter sizes and belts with how often they’re changed. Each month you get one order list to email to whoever buys them.</p></div>
       <div class="step"><h3>Export</h3><p>Send the whole list to Excel for turnover, O&amp;M or your maintenance system, and keep a full backup file with photos.</p></div>
     </div>
   </div>
 </section>
 
-<section class="sec" id="faq">
+<section class="sec alt" id="faq">
   <div class="wrap"><div class="faq">
     <div class="kicker">FAQ</div>
     <h2>Common questions</h2>
     <details><summary>Does it work without cell signal or Wi-Fi?</summary><p>Yes. After the app has been opened once, it keeps working offline – in basements, penthouses and plant rooms. Add it to your home screen and it opens like a normal app. Live camera scanning needs the app opened over https (it is, on the normal link); scanning from a photo and typing a tag always work.</p></details>
     <details><summary>Where is my data stored? Who can see it?</summary><p>Your projects, equipment and photos are saved in the browser on your own phone or computer. There is no account and nothing is uploaded to a server. To move data to another device or keep a safe copy, use <b>Settings → Backup</b> to save a file, and <b>Restore</b> on the other device.</p></details>
-    <details><summary>Can I get the data into Excel?</summary><p>Yes. Export a project to Excel (.xlsx) with an Assets sheet and a Parts (filters &amp; belts) sheet, or to CSV. You can also import an existing equipment schedule from Excel or CSV – the app matches the columns and shows a preview before anything is changed.</p></details>
+    <details><summary>Can I get the data into Excel?</summary><p>Yes. Export a project to Excel (.xlsx) with Assets, Parts (filters &amp; belts), Inspections and Inspection Items sheets, or to CSV. You can also import an existing equipment schedule from Excel or CSV – the app matches the columns and shows a preview before anything is changed.</p></details>
     <details><summary>Do I need to install anything or create an account?</summary><p>No. It runs in the phone’s browser (Safari on iPhone, Chrome on Android) or on a laptop. “Add to Home Screen” is optional and just makes it open full-screen.</p></details>
     <details><summary>What labels and scanners does it work with?</summary><p>It prints QR labels in three sizes (2×1″, 3×1.5″ and 4×2″) to a label printer or plain letter paper, or saves them as PDF. The scanner uses the phone camera and reads QR codes and common barcodes, so existing barcode tags can be used too.</p></details>
     <details><summary>Can a whole team share one project?</summary><p>Each device keeps its own data – there’s no live syncing. Teams share by exporting to Excel or passing a backup file, which can be restored on another device.</p></details>

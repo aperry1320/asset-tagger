@@ -1,4 +1,4 @@
-# Asset Tagger (v1.4.0)
+# Asset Tagger (v1.5.0)
 
 **Showcase page:** https://aperry1320.github.io/asset-tagger/demo/ ·
 **Live demo with sample data:** https://aperry1320.github.io/asset-tagger/?demo=1
@@ -59,6 +59,19 @@ Plain static files. No build step, no server code, no account. All data stays in
   Search finds assets by panel ("2A3" or "panel 2A3") and by fed-from tag; the list can be filtered by power panel and by fed-from unit.
   Export adds columns *Fed From, Feeds* (computed)*, Controlled By, Power Panel, Breaker/Circuit, Voltage/Phase, Disconnect Location*; import matches
   them loosely (Fed By, Served By, Panel, Ckt #, Circuit, Volts, Disconnect…). Older data and backups keep working (fields are simply blank).
+- **Inspection checklists** (v1.5.0): each equipment type has a default inspection / PM checklist (AHU: filters, belts & tension,
+  bearings, coils, drain pan & condensate, dampers & actuators, fan motor amps, controls / sensors, noise & vibration…; matching lists for
+  RTU, chiller, boiler, pump, VAV, FCU, exhaust fan, cooling tower, heat exchanger, VRF and Other). *Settings → Inspection checklists* edits
+  them (add / remove / reorder, required or optional, ask for a reading with a unit, default interval); *Checklist & schedule* on an asset
+  sets that unit's interval and adds extra items for it only. **Start inspection** copies the checklist into a draft (date, inspector name
+  remembered from last time). Each item is **Done / N/A / Fail**, with a reading where configured, a note, and photos on failures. Drafts save
+  as you go; **Complete** is blocked (with a list of what's left) until every required item is Done, N/A, or Fail with a note. Sign-off asks
+  for the inspector name and an optional finger signature. Result: *Passed* or *Passed with deficiencies*; deficiencies can be marked resolved.
+  Asset detail shows last inspection, next due and history; the list shows the last result. Per-project **Inspections** screen: overdue,
+  due this month / next month, in progress, open deficiencies, completed this month, never inspected. Printable report (print / Save as PDF),
+  plus Share / Copy / mailto text summary. Excel export adds *Inspections* (one row per inspection) and *Inspection Items* (one row per item)
+  sheets; backups include inspections, item photos and edited templates. Stored on the asset record (`inspections`, `inspFreq`, `inspExtra`),
+  so older data and backups load unchanged. Inspections are not imported from spreadsheets.
 - **Backup / restore** of all projects, assets and photos as a single .json file.
 - **Installable PWA**: a service worker caches everything, so the app opens and works with no signal after the first visit.
 
@@ -100,5 +113,7 @@ Any static host works. Upload the folder contents as-is.
 - Relationships are stored by tag within a project. Deleting an asset leaves other units pointing at its tag (shown as "not tagged yet");
   tags renamed by a spreadsheet import (rather than in the app) are not re-pointed. The panel view is a planning aid: always verify in the field before LOTO.
 - Spreadsheet exports don't include photos (they show a photo count). The JSON backup does include them.
+- Inspection templates are kept per device (in the browser, and in backup files); there's no shared template library between devices.
+- The inspection signature is a finger drawing saved with the record – it is not a certified e-signature.
 - When the app is updated, the new version loads on the second launch (stale-while-revalidate cache).
   Bump `CACHE` in sw.js with each release.

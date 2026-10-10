@@ -70,7 +70,7 @@ ul.ticks li::before{content:'';position:absolute;left:2px;top:11px;width:18px;he
 /* steps */
 .steps{display:grid;gap:16px;counter-reset:s;margin-top:8px}
 @media(min-width:700px){.steps{grid-template-columns:repeat(2,1fr)}}
-@media(min-width:1040px){.steps{grid-template-columns:repeat(5,1fr)}}
+@media(min-width:1040px){.steps{grid-template-columns:repeat(3,1fr)}}
 .step{background:#fff;border:1px solid var(--line);border-radius:var(--r);padding:20px;position:relative}
 .step::before{counter-increment:s;content:counter(s);display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:50%;background:var(--blue);color:#fff;font-weight:800;margin-bottom:10px}
 .step h3{margin:0 0 6px;font-size:19px}
