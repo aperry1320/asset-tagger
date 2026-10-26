@@ -1,8 +1,8 @@
 /* Asset Tagger service worker: precache app shell + libraries so the app works with no signal. */
-const CACHE = 'asset-tagger-v1.5.0';
+const CACHE = 'asset-tagger-v2.0.0';
 const ASSETS = [
   './', './index.html', './app.js', './styles.css', './manifest.webmanifest',
-  './vendor/qrcode-generator.js', './vendor/html5-qrcode.min.js', './vendor/xlsx.full.min.js',
+  './vendor/qrcode-generator.js', './vendor/html5-qrcode.min.js', './vendor/xlsx.full.min.js', './vendor/supabase.js',
   './icons/icon.svg', './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png',
 ];
 self.addEventListener('install', e => {

@@ -2,11 +2,15 @@
    Vanilla JS, data in IndexedDB. Vendor libs (loaded on demand): html5-qrcode, SheetJS (xlsx); qrcode-generator loaded up front. */
 'use strict';
 (() => {
-const APP_VERSION = '1.5.0';
+const APP_VERSION = '2.0.0';
 /* Demo mode (?demo=1): separate IndexedDB + storage keys, preloaded sample data. Never touches the real 'asset-tagger' DB. */
 const DEMO = /(?:^|[?&])demo=1(?:&|$)/.test(location.search.slice(1));
-const DB_NAME = DEMO ? 'asset-tagger-demo' : 'asset-tagger';
-const LSK = k => DEMO ? 'demo:' + k : k;
+/* ?local=1: the old single-device mode (no account, data only in this browser) – kept for viewing pre-v2 data and for tests. */
+const LOCAL = !DEMO && /(?:^|[?&])local=1(?:&|$)/.test(location.search.slice(1));
+let DB_NAME = DEMO ? 'asset-tagger-demo' : 'asset-tagger';
+let LS_PREFIX = DEMO ? 'demo:' : '';
+let CLOUD_ON = false; // true once signed in (never in demo mode)
+const LSK = k => LS_PREFIX + k;
 const TYPES = ['AHU','RTU','Chiller','Boiler','Pump','VAV','FCU','Exhaust Fan','Cooling Tower','Heat Exchanger','VRF Unit','Other'];
 const STATUSES = ['Not started','Installed','Started up','Commissioned','Issue'];
 const STATUS_CLASS = {'Not started':'s-none','Installed':'s-inst','Started up':'s-start','Commissioned':'s-cx','Issue':'s-issue'};
@@ -322,8 +326,13 @@ const DB = (() => {
     async get(store, key) { const db = await open(); return rq(db.transaction(store).objectStore(store).get(key)); },
     async all(store) { const db = await open(); return rq(db.transaction(store).objectStore(store).getAll()); },
     async by(store, index, val) { const db = await open(); return rq(db.transaction(store).objectStore(store).index(index).getAll(val)); },
-    async put(store, ...objs) { const db = await open(); const t = db.transaction(store, 'readwrite'); objs.forEach(o => t.objectStore(store).put(o)); return done(t); },
-    async del(store, ...keys) { const db = await open(); const t = db.transaction(store, 'readwrite'); keys.forEach(k => t.objectStore(store).delete(k)); return done(t); },
+    async put(store, ...objs) { const db = await open(); const t = db.transaction(store, 'readwrite'); objs.forEach(o => t.objectStore(store).put(o)); await done(t); if (CLOUD_ON && !this._raw && objs.length) Cloud.track(store, objs); },
+    async del(store, ...keys) {
+      const db = await open();
+      if (CLOUD_ON && !this._raw && keys.length) Cloud.trackDel(store, keys);
+      const t = db.transaction(store, 'readwrite'); keys.forEach(k => t.objectStore(store).delete(k)); return done(t);
+    },
+    _raw: false,
     async clear() { const db = await open(); const t = db.transaction(['projects','assets','photos'], 'readwrite'); ['projects','assets','photos'].forEach(s => t.objectStore(s).clear()); return done(t); },
   };
 })();
@@ -757,7 +766,7 @@ const normItem = (it, keepResult) => {
   return o;
 };
 function loadTplStore() { try { return JSON.parse(localStorage.getItem(LSK('at-insp-tpl')) || '{}') || {}; } catch (e) { return {}; } }
-function saveTplStore(s) { localStorage.setItem(LSK('at-insp-tpl'), JSON.stringify(s)); }
+function saveTplStore(s) { localStorage.setItem(LSK('at-insp-tpl'), JSON.stringify(s)); if (CLOUD_ON) Cloud.trackTpl(); }
 const tplType = type => INSP_DEFAULTS[type] ? type : 'Other';
 function defaultTemplate(type) { const d = INSP_DEFAULTS[tplType(type)]; return {freq: d.freq, items: d.items.map((x, i) => normItem({...x, id: `d-${slug(tplType(type)).toLowerCase()}-${i}`}))}; }
 function getTemplate(type) {
@@ -1365,6 +1374,500 @@ function demoInspections(assets, t) {
   [1, 2, 3].forEach(i => mkI(`RTU-${i}`, P2, inMonth(i), {by: 'A. Sample (demo)'}));
 }
 
+/* ---------------- Cloud: Supabase login, roles, sync (v2) ----------------
+   Local IndexedDB stays the working copy (so the app runs with no signal). Every local write is queued in an
+   outbox (localStorage) and pushed to Supabase when online; then everything the account can see is pulled
+   back. Conflicts: last write wins (whole record). Demo mode never loads any of this. */
+const SB_URL = 'https://xqbptmdhppabqdoyhpdh.supabase.co';
+const SB_KEY = 'sb_publishable_C7SrxDyP2qTDWDrwPaA-5w_YFRfr3XT'; // publishable (public) key – safe in the client; RLS protects data
+const APP_URL = 'https://aperry1320.github.io/asset-tagger/';
+const AUTH_HASH = /access_token=|error_description=|error_code=/.test(location.hash) ? location.hash : '';
+const ROLE_LABEL = {god: 'God (setup)', admin: 'Admin (site manager)', user: 'User'};
+const Cloud = {
+  sb: null, session: null, me: null, adminSites: new Set(), memberSites: new Set(), online: navigator.onLine,
+  syncing: false, lastSync: localStorage.getItem('at-cloud-last') || '', lastError: '', _timer: null, rejected: 0,
+  get on() { return CLOUD_ON; },
+  role() { return this.me ? this.me.role : 'user'; },
+  isGod() { return this.role() === 'god'; },
+  isAdmin() { return ['god', 'admin'].includes(this.role()); },
+  canAdminSite(pid) { return !CLOUD_ON || this.isGod() || (this.role() === 'admin' && this.adminSites.has(pid)); },
+  canCreateSite() { return !CLOUD_ON || this.isGod(); },
+  canEditTemplates() { return !CLOUD_ON || this.isAdmin(); },
+  /* ---- outbox ---- */
+  _ob: null,
+  outbox() { if (!this._ob) { try { this._ob = JSON.parse(localStorage.getItem(LSK('at-outbox')) || '{}'); } catch (e) { this._ob = {}; } } return this._ob; },
+  saveOutbox() { localStorage.setItem(LSK('at-outbox'), JSON.stringify(this._ob || {})); updateSyncBadge(); },
+  pending() { return Object.keys(this.outbox()).length; },
+  track(store, objs) { const ob = this.outbox(); objs.forEach(o => { ob[store + ':' + o.id] = {s: store, id: o.id, op: 'put', t: Date.now()}; }); this.saveOutbox(); this.soon(); },
+  trackDel(store, keys, meta = {}) { const ob = this.outbox(); keys.forEach(k => { ob[store + ':' + k] = {s: store, id: k, op: 'del', t: Date.now(), ...(meta[k] || {})}; }); this.saveOutbox(); this.soon(); },
+  trackTpl() { const ob = this.outbox(); ob['tpl:all'] = {s: 'tpl', id: 'all', op: 'put', t: Date.now()}; this.saveOutbox(); this.soon(); },
+  soon(ms = 1200) { clearTimeout(this._timer); this._timer = setTimeout(() => this.sync().catch(() => {}), ms); },
+  /* ---- auth ---- */
+  async init() {
+    await loadScript('vendor/supabase.js');
+    this.sb = window.supabase.createClient(SB_URL, SB_KEY, {auth: {persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, flowType: 'implicit', storageKey: 'at-auth'}});
+    this.sb.auth.onAuthStateChange((ev, s) => {
+      this.session = s;
+      if (ev === 'PASSWORD_RECOVERY') this.recovery = true;
+    });
+    const {data} = await this.sb.auth.getSession();
+    this.session = data.session;
+    window.addEventListener('online', () => { this.online = true; updateSyncBadge(); this.soon(300); });
+    window.addEventListener('offline', () => { this.online = false; updateSyncBadge(); });
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && this.session) this.soon(500); });
+    setInterval(() => { if (this.session && navigator.onLine) this.sync().catch(() => {}); }, 120000);
+  },
+  user() { return this.session && this.session.user; },
+  async useAccount() {
+    const u = this.user(); if (!u) return;
+    DB_NAME = 'asset-tagger-cloud-' + u.id; LS_PREFIX = 'c:' + u.id.slice(0, 8) + ':'; this._ob = null;
+    try { this.me = JSON.parse(localStorage.getItem(LSK('at-me')) || 'null'); } catch (e) { this.me = null; }
+    if (this.me) { this.adminSites = new Set(this.me.adminSites || []); this.memberSites = new Set(this.me.memberSites || []); }
+    if (navigator.onLine || !this.me) await this.loadMe();
+  },
+  async loadMe() {
+    const u = this.user();
+    const [{data: p, error}, {data: sa}, {data: sm}] = await Promise.all([
+      this.sb.from('profiles').select('*').eq('id', u.id).maybeSingle(),
+      this.sb.from('site_admins').select('site_id').eq('user_id', u.id),
+      this.sb.from('site_members').select('site_id').eq('user_id', u.id)]);
+    if (error) { if (!this.me) this.me = {id: u.id, email: u.email, role: 'user', full_name: ''}; return; }
+    this.me = {...(p || {id: u.id, email: u.email, role: 'user', full_name: ''}), adminSites: (sa || []).map(r => r.site_id), memberSites: (sm || []).map(r => r.site_id)};
+    this.adminSites = new Set(this.me.adminSites); this.memberSites = new Set(this.me.memberSites);
+    localStorage.setItem(LSK('at-me'), JSON.stringify(this.me));
+  },
+  async signOut() {
+    const n = this.pending();
+    if (n && !await confirmBox('Sign out?', `${n} change(s) haven't synced yet and will be lost if you sign out now. Connect to the internet first to sync them.`, 'Sign out anyway', true)) return;
+    if (!n && !await confirmBox('Sign out?', 'Your synced data stays in the cloud. This device\'s copy is cleared.', 'Sign out')) return;
+    try { await this.sb.auth.signOut(); } catch (e) {}
+    try { await DB.clear(true); } catch (e) {}
+    Object.keys(localStorage).filter(k => k.startsWith(LS_PREFIX)).forEach(k => localStorage.removeItem(k));
+    location.replace(location.pathname + '#/'); location.reload();
+  },
+  /* ---- sync ---- */
+  async sync() {
+    if (!this.session || this.syncing) return;
+    if (!navigator.onLine) { this.online = false; updateSyncBadge(); return; }
+    this.syncing = true; updateSyncBadge();
+    let changed = false;
+    try {
+      await this.push();
+      changed = await this.pull();
+      this.lastSync = nowISO(); localStorage.setItem('at-cloud-last', this.lastSync); this.lastError = '';
+    } catch (e) {
+      this.lastError = e.message || String(e); console.warn('Sync failed', e);
+    } finally { this.syncing = false; updateSyncBadge(); }
+    if (changed) refreshIfSafe();
+    if (this.rejected) { toast(`${this.rejected} change(s) were not allowed for your account and were skipped`, 4000); this.rejected = 0; }
+  },
+  isNetErr(e) { return !e || /fetch|network|Failed to fetch|timeout|NetworkError|Load failed/i.test(e.message || String(e)) && !e.code; },
+  async push() {
+    const ob = this.outbox();
+    const order = e => ({projects: e.op === 'put' ? 0 : 9, tpl: 1, assets: e.op === 'put' ? 2 : 8, photos: e.op === 'put' ? 3 : 7}[e.s] ?? 5);
+    const items = Object.entries(ob).sort((a, b) => order(a[1]) - order(b[1]) || a[1].t - b[1].t);
+    for (const [k, e] of items) {
+      if (ob[k] !== e) continue;
+      let err = null;
+      try { err = await this.pushOne(e); } catch (x) { err = x; }
+      if (err) {
+        if (this.isNetErr(err)) throw err;
+        const perm = err.code === '42501' || err.statusCode === '403' || err.status === 403 || /row-level security|permission|Unauthorized/i.test(err.message || '');
+        if (perm) { this.rejected++; await this.revert(e); }
+        else if (err.code === '23503' && (e.tries = (e.tries || 0) + 1) < 5) { this.saveOutbox(); continue; }
+        else console.warn('Sync dropped', e, err);
+      }
+      if (ob[k] && ob[k].t === e.t) delete ob[k];
+      this.saveOutbox();
+    }
+  },
+  /** A rejected change is undone locally by re-pulling that record on the next pull (we just forget the local edit). */
+  async revert(e) { this._forceRepull = true; },
+  async pushOne(e) {
+    const sb = this.sb;
+    if (e.s === 'tpl') {
+      const st = loadTplStore(), rows = Object.entries(st).map(([type, data]) => ({type, data}));
+      if (rows.length) { const {error} = await sb.from('checklist_templates').upsert(rows); if (error) return error; }
+      const {data: cur, error: e2} = await sb.from('checklist_templates').select('type'); if (e2) return e2;
+      const gone = (cur || []).map(r => r.type).filter(t => !st[t]);
+      if (gone.length) { const {error} = await sb.from('checklist_templates').delete().in('type', gone); if (error) return error; }
+      return null;
+    }
+    if (e.op === 'put') {
+      const o = await DB.get(e.s, e.id); if (!o) return null;
+      if (e.s === 'projects') { const {error} = await sb.from('sites').upsert({id: o.id, name: o.name || '', data: o}); return error; }
+      if (e.s === 'assets') {
+        const {error} = await sb.from('assets').upsert({id: o.id, site_id: o.projectId, tag: o.tag || '', type: o.type || '', data: o}); return error;
+      }
+      if (e.s === 'photos') {
+        const a = await DB.get('assets', o.assetId); if (!a) return null;
+        const path = `${a.projectId}/${o.assetId}/${o.id}`;
+        const up = await sb.storage.from('photos').upload(path, o.blob, {upsert: true, contentType: o.type || 'image/jpeg'});
+        if (up.error) return up.error;
+        const {error} = await sb.from('photos').upsert({id: o.id, site_id: a.projectId, asset_id: o.assetId, insp_id: o.inspId || null, item_id: o.itemId || null, type: o.type || 'image/jpeg', storage_path: path, created_at: o.createdAt || nowISO()});
+        return error;
+      }
+    } else {
+      if (e.s === 'projects') { const {error} = await sb.from('sites').delete().eq('id', e.id); return error; }
+      if (e.s === 'assets') {
+        const {data: ph} = await sb.from('photos').select('id,storage_path').eq('asset_id', e.id);
+        const {error} = await sb.from('assets').delete().eq('id', e.id); if (error) return error;
+        if (ph && ph.length) { await sb.storage.from('photos').remove(ph.map(p => p.storage_path)); await sb.from('photos').delete().eq('asset_id', e.id); }
+        return null;
+      }
+      if (e.s === 'photos') {
+        const {data: ph} = await sb.from('photos').select('storage_path').eq('id', e.id).maybeSingle();
+        if (ph) await sb.storage.from('photos').remove([ph.storage_path]);
+        const {error} = await sb.from('photos').delete().eq('id', e.id); return error;
+      }
+    }
+    return null;
+  },
+  async fetchAll(table, cols = '*') {
+    const out = []; const N = 1000;
+    for (let i = 0; ; i += N) {
+      const {data, error} = await this.sb.from(table).select(cols).range(i, i + N - 1);
+      if (error) throw error; out.push(...data); if (data.length < N) break;
+    }
+    return out;
+  },
+  async pull() {
+    await this.loadMe();
+    const [sites, assets, photos, tpls] = await Promise.all([this.fetchAll('sites'), this.fetchAll('assets'), this.fetchAll('photos'), this.fetchAll('checklist_templates')]);
+    const ob = this.outbox(); const pend = (s, id) => !!ob[s + ':' + id];
+    let changed = false;
+    const reconcile = async (store, remote, toLocal) => {
+      const local = await DB.all(store); const lmap = new Map(local.map(o => [o.id, o])); const rids = new Set();
+      const puts = [];
+      for (const r of remote) {
+        rids.add(r.id); if (pend(store, r.id)) continue;
+        const o = toLocal(r), l = lmap.get(r.id);
+        if (!l || (l.updatedAt || '') !== (o.updatedAt || '') || JSON.stringify({...l, blob: 0}) !== JSON.stringify({...o, blob: 0})) puts.push(o);
+      }
+      if (puts.length) { await DB.put(store, ...puts.map(o => ({...lmap.get(o.id) && store === 'photos' ? {blob: lmap.get(o.id).blob} : {}, ...o}))); changed = true; }
+      const dels = local.filter(o => !rids.has(o.id) && !pend(store, o.id)).map(o => o.id);
+      if (dels.length) { await DB.del(store, ...dels); changed = true; }
+    };
+    DB._raw = true;
+    try {
+      await reconcile('projects', sites, r => ({...r.data, id: r.id, name: r.name || (r.data && r.data.name) || ''}));
+      await reconcile('assets', assets, r => ({...r.data, id: r.id, projectId: r.site_id}));
+      // photos: metadata first, then download any blob we don't have yet
+      const have = new Map((await DB.all('photos')).map(p => [p.id, p]));
+      const keep = photos.filter(r => !pend('photos', r.id));
+      for (const r of keep) {
+        const l = have.get(r.id);
+        if (l && l.blob) continue;
+        const {data: blob, error} = await this.sb.storage.from('photos').download(r.storage_path);
+        if (error || !blob) continue;
+        await DB.put('photos', {id: r.id, assetId: r.asset_id, ...(r.insp_id ? {inspId: r.insp_id, itemId: r.item_id} : {}), type: r.type, createdAt: r.created_at, blob}); changed = true;
+      }
+      const rids = new Set(photos.map(r => r.id));
+      const pdel = [...have.keys()].filter(id => !rids.has(id) && !pend('photos', id));
+      if (pdel.length) { await DB.del('photos', ...pdel); changed = true; }
+    } finally { DB._raw = false; }
+    if (!pend('tpl', 'all')) {
+      const st = {}; tpls.forEach(r => { st[r.type] = r.data; });
+      if (JSON.stringify(st) !== JSON.stringify(loadTplStore())) { localStorage.setItem(LSK('at-insp-tpl'), JSON.stringify(st)); changed = true; }
+    }
+    return changed;
+  },
+  async invoke(body) {
+    const {data, error} = await this.sb.functions.invoke('manage-users', {body});
+    if (error) { let msg = error.message; try { const j = await error.context.json(); msg = j.error || msg; } catch (e) {} throw new Error(msg); }
+    if (data && data.error) throw new Error(data.error);
+    return data;
+  },
+};
+function refreshIfSafe() {
+  if (document.querySelector('dialog[open]')) return;
+  const h = location.hash;
+  if (/\/edit|\/a\/new|\/i\/|\/settings\/checklists\/|#\/import|#\/users|#\/team/.test(h)) return;
+  route();
+}
+function updateSyncBadge() {
+  const b = document.getElementById('syncBadge'); if (!b) return;
+  const n = Cloud.pending();
+  let cls = 'ok', txt = '✓';
+  if (!navigator.onLine) { cls = 'off'; txt = n ? `⏸ ${n}` : '⏸'; }
+  else if (Cloud.syncing) { cls = 'busy'; txt = '⟳'; }
+  else if (Cloud.lastError) { cls = 'err'; txt = '!'; }
+  else if (n) { cls = 'busy'; txt = `↑${n}`; }
+  b.className = 'sync-badge ' + cls; b.textContent = txt;
+  b.title = !navigator.onLine ? `Offline – ${n} change(s) will sync when you're back online` : Cloud.lastError ? 'Sync problem: ' + Cloud.lastError : n ? `${n} change(s) waiting to sync` : 'All changes synced';
+}
+function accountButton() {
+  if (!CLOUD_ON || !Cloud.me) return '';
+  const nm = Cloud.me.full_name || Cloud.me.email || '?';
+  const ini = nm.split(/[\s@.]+/).filter(Boolean).slice(0, 2).map(s => s[0].toUpperCase()).join('');
+  return `<button class="icon-btn acct-btn" id="acctBtn" aria-label="Account: ${esc(nm)}"><span class="acct-ini">${esc(ini)}</span><span id="syncBadge" class="sync-badge"></span></button>`;
+}
+function bindAccountButton() {
+  const b = $('#acctBtn'); if (!b) return; updateSyncBadge();
+  b.onclick = () => {
+    const me = Cloud.me, n = Cloud.pending();
+    const m = modal({title: 'Account', body: `
+      <p style="margin:0 0 4px"><b>${esc(me.full_name || me.email)}</b></p>
+      <p class="small muted" style="margin:0 0 6px">${esc(me.email)} · <span class="badge" id="acctRole">${esc(ROLE_LABEL[me.role] || me.role)}</span></p>
+      <p class="small" id="acctSync">${navigator.onLine ? (n ? `${n} change(s) waiting to sync.` : 'All changes synced.') : `Offline – ${n} change(s) queued; they sync automatically when you're back online.`}${Cloud.lastSync ? `<br><span class="muted">Last sync ${esc(new Date(Cloud.lastSync).toLocaleString())}</span>` : ''}${Cloud.lastError ? `<br><span class="over-txt">Last problem: ${esc(Cloud.lastError)}</span>` : ''}</p>
+      <div class="menu">
+        <button class="btn" data-a="sync">⟳ Sync now</button>
+        ${Cloud.isGod() ? '<button class="btn" data-a="users">👥 Users &amp; roles</button>' : ''}
+        ${Cloud.isAdmin() ? '<button class="btn" data-a="team">🧑‍🔧 Team – assign users to my sites</button><button class="btn" data-a="import">📥 Import my existing data</button>' : ''}
+        <button class="btn" data-a="pw">🔑 Change password</button>
+        <button class="btn danger" data-a="out">Sign out</button></div>`});
+    m.el.addEventListener('click', async e => {
+      const a = e.target.closest('[data-a]'); if (!a) return; m.close();
+      const k = a.dataset.a;
+      if (k === 'sync') { await Cloud.sync(); toast(Cloud.lastError ? 'Sync failed: ' + Cloud.lastError : 'Synced'); }
+      if (k === 'users') go('/users'); if (k === 'team') go('/team'); if (k === 'import') go('/import');
+      if (k === 'pw') setPasswordDialog(false);
+      if (k === 'out') Cloud.signOut();
+    });
+  };
+}
+/* ---- login / password screens ---- */
+function renderLogin(msg = '') {
+  setChrome('Asset Tagger', null, ''); setBottomBar('');
+  view.innerHTML = `<div class="login-wrap"><div class="card login-card">
+    <div class="login-logo"><img src="icons/icon.svg" alt="" width="56" height="56"></div>
+    <h2 style="text-align:center;margin:6px 0 2px">Sign in</h2>
+    <p class="muted small" style="text-align:center;margin:0 0 12px">Your account decides which sites you can see.</p>
+    ${msg ? `<div class="notice warn small" id="loginMsg">${msg}</div>` : ''}
+    <form id="loginForm" autocomplete="on">
+      <div class="field"><label for="liEmail">Email</label><input id="liEmail" type="email" autocomplete="username" autocapitalize="off" spellcheck="false" required></div>
+      <div class="field"><label for="liPw">Password</label><input id="liPw" type="password" autocomplete="current-password" required></div>
+      <button class="btn primary block" id="liGo" type="submit">Sign in</button>
+    </form>
+    <button class="btn block" id="liForgot" style="margin-top:8px">Forgot password? / First time? Set a password</button>
+    <p class="muted small" style="margin:14px 0 0;text-align:center">No account? Ask your site Admin to invite you.<br><a href="?demo=1#/">Try the demo</a> · <a href="demo/">About the app</a></p>
+  </div></div>`;
+  $('#loginForm').onsubmit = async e => {
+    e.preventDefault();
+    if (!navigator.onLine) return toast('You need a connection to sign in the first time', 3500);
+    const b = $('#liGo'); b.disabled = true; b.textContent = 'Signing in…';
+    const {error} = await Cloud.sb.auth.signInWithPassword({email: $('#liEmail').value.trim(), password: $('#liPw').value});
+    if (error) { b.disabled = false; b.textContent = 'Sign in'; toast(error.message === 'Invalid login credentials' ? 'Wrong email or password' : error.message, 3500); return; }
+    location.reload();
+  };
+  $('#liForgot').onclick = () => {
+    modal({title: 'Set or reset your password', body: `<p class="small">Enter your email. We'll send you a link – open it on this device to choose a new password.</p>
+      <div class="field"><label for="fpEmail">Email</label><input id="fpEmail" type="email" autocapitalize="off" value="${esc($('#liEmail').value)}"></div>`,
+      actions: [{label: 'Cancel'}, {label: 'Send link', cls: 'primary', onClick: async d => {
+        const em = $('#fpEmail', d).value.trim(); if (!em) return false;
+        const {error} = await Cloud.sb.auth.resetPasswordForEmail(em, {redirectTo: APP_URL});
+        if (error) { toast(error.message, 4000); return false; }
+        toast('Check your email for the link', 4000);
+      }}]});
+  };
+}
+function setPasswordDialog(firstTime) {
+  modal({title: firstTime ? 'Choose your password' : 'Change password', body: `
+    ${firstTime ? '<p class="small">Welcome! Pick a password for signing in to Asset Tagger.</p>' : ''}
+    <div class="field"><label for="npw1">New password (8+ characters)</label><input id="npw1" type="password" autocomplete="new-password"></div>
+    <div class="field"><label for="npw2">Repeat new password</label><input id="npw2" type="password" autocomplete="new-password"></div>`,
+    actions: [{label: firstTime ? 'Later' : 'Cancel'}, {label: 'Save password', cls: 'primary', onClick: async d => {
+      const a = $('#npw1', d).value, b = $('#npw2', d).value;
+      if (a.length < 8) { toast('Use at least 8 characters'); return false; }
+      if (a !== b) { toast("Passwords don't match"); return false; }
+      const {error} = await Cloud.sb.auth.updateUser({password: a});
+      if (error) { toast(error.message, 4000); return false; }
+      toast('Password saved');
+    }}]});
+}
+/* ---- God: Users & roles ---- */
+async function loadDirectory() {
+  const [profiles, sites, admins, members] = await Promise.all([Cloud.fetchAll('profiles'), Cloud.fetchAll('sites', 'id,name'), Cloud.fetchAll('site_admins'), Cloud.fetchAll('site_members')]);
+  profiles.sort((a, b) => natCmp(({god: 0, admin: 1, user: 2})[a.role], ({god: 0, admin: 1, user: 2})[b.role]) || natCmp(a.full_name || a.email, b.full_name || b.email));
+  sites.sort((a, b) => natCmp(a.name, b.name));
+  return {profiles, sites, admins, members, siteName: id => (sites.find(s => s.id === id) || {}).name || id};
+}
+const needOnline = () => { if (!navigator.onLine) { view.innerHTML = '<div class="empty"><div class="big">📶</div><p><b>You\'re offline.</b></p><p>Managing users needs a connection.</p></div>'; return true; } return false; };
+function inviteForm(sites, {roles, defaultRole = 'user', siteRequired}) {
+  return `<div class="card" id="invCard"><div class="lbl">Invite / add a person</div>
+    <div class="field"><label for="invEmail">Email <span class="req">*</span></label><input id="invEmail" type="email" autocapitalize="off" spellcheck="false" placeholder="name@company.com"></div>
+    <div class="field"><label for="invName">Name</label><input id="invName" autocomplete="off"></div>
+    ${roles.length > 1 ? `<div class="field"><label for="invRole">Role</label><select id="invRole">${roles.map(r => `<option value="${r}" ${r === defaultRole ? 'selected' : ''}>${esc(ROLE_LABEL[r])}</option>`).join('')}</select></div>` : ''}
+    <div class="field"><label for="invSite">Site${siteRequired ? ' <span class="req">*</span>' : ''}</label><select id="invSite">${siteRequired ? '' : '<option value="">— none yet —</option>'}${sites.map(s => `<option value="${esc(s.id)}">${esc(s.name)}</option>`).join('')}</select></div>
+    <div class="field"><label for="invPw">Temporary password (optional)</label><input id="invPw" type="text" autocomplete="off" placeholder="Leave blank to email an invite link">
+      <p class="muted small" style="margin:6px 0 0">Blank = they get an email to set their own password. Or type a temporary password (8+ chars) and give it to them yourself – no email needed.</p></div>
+    <button class="btn primary block" id="invGo">Invite</button></div>`;
+}
+function bindInvite(after) {
+  $('#invGo').onclick = async () => {
+    const email = $('#invEmail').value.trim(); if (!email) return toast('Enter an email');
+    const b = $('#invGo'); b.disabled = true;
+    try {
+      const r = await Cloud.invoke({action: 'invite', email, full_name: $('#invName').value.trim(), role: $('#invRole') ? $('#invRole').value : 'user', site_id: $('#invSite').value || null, password: $('#invPw').value || undefined, redirect_to: APP_URL});
+      toast(r.created ? (r.emailed ? `Invite emailed to ${email}` : `Account created for ${email}`) : `${email} added`, 3500);
+      after();
+    } catch (e) { toast(e.message, 4500); b.disabled = false; }
+  };
+}
+async function renderUsers() {
+  setChrome('Users & roles', '/', accountButton()); bindAccountButton();
+  if (!Cloud.isGod()) return go('/', true);
+  if (needOnline()) return;
+  view.innerHTML = '<div class="empty">Loading…</div>';
+  const D = await loadDirectory();
+  const chip = (sid, kind, uidv) => `<span class="badge ${kind === 'admin' ? '' : 'mem'}" style="margin:2px 4px 2px 0">${kind === 'admin' ? '★ ' : ''}${esc(D.siteName(sid))} <button class="x-btn" data-unassign="${kind}|${esc(sid)}|${uidv}" aria-label="Remove">×</button></span>`;
+  view.innerHTML = `<p class="small muted">God sets roles and creates sites. <b>Admins</b> manage the sites you assign them (★) and can add Users to those sites. <b>Users</b> only see sites they're assigned to.</p>
+    ${inviteForm(D.sites, {roles: ['user', 'admin', 'god'], defaultRole: 'admin'})}
+    <h2>People (${D.profiles.length})</h2><div class="list" id="userList">${D.profiles.map(p => {
+      const a = D.admins.filter(x => x.user_id === p.id).map(x => chip(x.site_id, 'admin', p.id));
+      const m = D.members.filter(x => x.user_id === p.id).map(x => chip(x.site_id, 'member', p.id));
+      const self = p.id === Cloud.me.id;
+      return `<div class="item user-row" data-uid="${p.id}"><div class="main">
+        <div class="t">${esc(p.full_name || p.email)}${self ? ' <span class="muted small">(you)</span>' : ''}</div>
+        <div class="sub">${esc(p.email)}</div>
+        <div class="row" style="margin-top:6px;align-items:center;gap:6px"><select class="roleSel" data-uid="${p.id}" ${self ? 'disabled' : ''} aria-label="Role">${['god', 'admin', 'user'].map(r => `<option value="${r}" ${p.role === r ? 'selected' : ''}>${esc(ROLE_LABEL[r])}</option>`).join('')}</select>
+          <button class="btn sm" data-assign="${p.id}">+ Site</button>${self ? '' : `<button class="btn sm danger" data-deluser="${p.id}">Remove</button>`}</div>
+        <div style="margin-top:6px">${a.join('')}${m.join('')}${!a.length && !m.length ? '<span class="muted small">No sites assigned – sees nothing yet.</span>' : ''}</div></div></div>`;
+    }).join('')}</div>`;
+  bindInvite(() => renderUsers());
+  view.querySelectorAll('.roleSel').forEach(s => s.onchange = async () => {
+    const {error} = await Cloud.sb.from('profiles').update({role: s.value}).eq('id', s.dataset.uid);
+    toast(error ? error.message : 'Role updated'); renderUsers();
+  });
+  view.onclick = async e => {
+    const un = e.target.closest('[data-unassign]');
+    if (un) {
+      const [kind, sid, u] = un.dataset.unassign.split('|');
+      const {error} = await Cloud.sb.from(kind === 'admin' ? 'site_admins' : 'site_members').delete().eq('site_id', sid).eq('user_id', u);
+      toast(error ? error.message : 'Removed from site'); return renderUsers();
+    }
+    const as = e.target.closest('[data-assign]');
+    if (as) {
+      const u = as.dataset.assign, p = D.profiles.find(x => x.id === u);
+      return modal({title: `Assign ${esc(p.full_name || p.email)}`, body: `<div class="field"><label for="asSite">Site</label><select id="asSite">${D.sites.map(s => `<option value="${esc(s.id)}">${esc(s.name)}</option>`).join('')}</select></div>
+        <div class="field"><label for="asKind">As</label><select id="asKind"><option value="member">User (works on the site)</option>${p.role !== 'user' ? '<option value="admin" selected>Admin (manages the site)</option>' : ''}</select></div>`,
+        actions: [{label: 'Cancel'}, {label: 'Assign', cls: 'primary', onClick: async d => {
+          if (!D.sites.length) { toast('Create a site first'); return; }
+          const kind = $('#asKind', d).value;
+          const {error} = await Cloud.sb.from(kind === 'admin' ? 'site_admins' : 'site_members').upsert({site_id: $('#asSite', d).value, user_id: u}, {ignoreDuplicates: true});
+          toast(error ? error.message : 'Assigned'); renderUsers();
+        }}]});
+    }
+    const du = e.target.closest('[data-deluser]');
+    if (du) {
+      const p = D.profiles.find(x => x.id === du.dataset.deluser);
+      if (!await confirmBox('Remove account?', `Delete <b>${esc(p.email)}</b>'s login? Their past edits stay.`, 'Delete account', true)) return;
+      try { await Cloud.invoke({action: 'delete', user_id: p.id}); toast('Account removed'); } catch (x) { toast(x.message, 4000); }
+      renderUsers();
+    }
+  };
+}
+/* ---- Admin (and God): Team for my sites ---- */
+async function renderTeam() {
+  setChrome('Team', '/', accountButton()); bindAccountButton();
+  if (!Cloud.isAdmin()) return go('/', true);
+  if (needOnline()) return;
+  view.innerHTML = '<div class="empty">Loading…</div>';
+  await Cloud.loadMe();
+  const D = await loadDirectory();
+  const mySites = Cloud.isGod() ? D.sites : D.sites.filter(s => Cloud.adminSites.has(s.id));
+  const users = D.profiles.filter(p => p.role === 'user');
+  view.innerHTML = `<p class="small muted">Add people to the sites you manage. Users see and edit only the sites they're on.</p>
+    ${mySites.length ? inviteForm(mySites, {roles: ['user'], siteRequired: true}) : '<div class="notice warn">You are not the Admin of any site yet. Ask the God account to assign you.</div>'}
+    ${mySites.map(s => {
+      const ad = D.admins.filter(x => x.site_id === s.id).map(x => D.profiles.find(p => p.id === x.user_id)).filter(Boolean);
+      const mem = D.members.filter(x => x.site_id === s.id).map(x => D.profiles.find(p => p.id === x.user_id)).filter(Boolean);
+      const avail = users.filter(u => !mem.some(m => m.id === u.id));
+      return `<div class="card team-site" data-site="${esc(s.id)}"><div class="lbl">${esc(s.name)}</div>
+        <p class="small" style="margin:4px 0">Admins: ${ad.length ? ad.map(p => esc(p.full_name || p.email)).join(', ') : '<span class="muted">none</span>'}</p>
+        <div class="list">${mem.map(p => `<div class="item"><div class="main"><div class="t">${esc(p.full_name || p.email)}</div><div class="sub">${esc(p.email)}</div></div><button class="btn sm danger" data-rm="${esc(s.id)}|${p.id}">Remove</button></div>`).join('') || '<p class="muted small">No users on this site yet.</p>'}</div>
+        ${avail.length ? `<div class="row" style="margin-top:8px"><select class="addSel" aria-label="Add user">${avail.map(u => `<option value="${u.id}">${esc(u.full_name || u.email)}</option>`).join('')}</select><button class="btn sm primary" data-add="${esc(s.id)}">Add to site</button></div>` : ''}</div>`;
+    }).join('')}`;
+  if (mySites.length) bindInvite(() => renderTeam());
+  view.onclick = async e => {
+    const rm = e.target.closest('[data-rm]');
+    if (rm) { const [sid, u] = rm.dataset.rm.split('|'); const {error} = await Cloud.sb.from('site_members').delete().eq('site_id', sid).eq('user_id', u); toast(error ? error.message : 'Removed'); return renderTeam(); }
+    const ad = e.target.closest('[data-add]');
+    if (ad) { const sel = ad.parentElement.querySelector('.addSel'); const {error} = await Cloud.sb.from('site_members').upsert({site_id: ad.dataset.add, user_id: sel.value}, {ignoreDuplicates: true}); toast(error ? error.message : 'User added to site'); return renderTeam(); }
+  };
+}
+/* ---- Import my existing data (old local version / JSON backup) ---- */
+function readLegacyDB() {
+  return new Promise(res => {
+    let created = false;
+    const r = indexedDB.open('asset-tagger');
+    r.onupgradeneeded = () => { created = true; };
+    r.onerror = () => res(null);
+    r.onsuccess = async () => {
+      const db = r.result;
+      if (created || !db.objectStoreNames.contains('projects')) { db.close(); if (created) indexedDB.deleteDatabase('asset-tagger'); return res(null); }
+      const all = s => new Promise((ok, no) => { const q = db.transaction(s).objectStore(s).getAll(); q.onsuccess = () => ok(q.result); q.onerror = () => no(q.error); });
+      try {
+        const out = {projects: await all('projects'), assets: await all('assets'), photos: await all('photos')};
+        let tpl = {}; try { tpl = JSON.parse(localStorage.getItem('at-insp-tpl') || '{}'); } catch (e) {}
+        out.settings = {inspTemplates: tpl}; db.close(); res(out.projects.length ? out : null);
+      } catch (e) { db.close(); res(null); }
+    };
+  });
+}
+async function renderImport() {
+  setChrome('Import my existing data', '/', accountButton()); bindAccountButton();
+  if (!Cloud.isAdmin()) return go('/', true);
+  const legacy = await readLegacyDB();
+  const mySites = (await Data.projects()).filter(p => Cloud.canAdminSite(p.id)).sort((a, b) => natCmp(a.name, b.name));
+  view.innerHTML = `<p class="small">Bring data from the old on-this-phone version (v1) into the shared cloud sites. Nothing is deleted from the source.</p>
+    ${legacy ? `<div class="card"><div class="lbl">Found on this device</div><p class="small" style="margin:4px 0 8px">${legacy.projects.length} project(s) · ${legacy.assets.length} asset(s) · ${legacy.photos.length} photo(s) saved by the old version of the app in this browser.</p><button class="btn primary block" id="impLegacy">Use this device's old data</button></div>` : ''}
+    <div class="card"><div class="lbl">From a backup file</div><p class="small" style="margin:4px 0 8px">On the old version: Settings → Backup → Download backup (.json). Then pick that file here.</p>
+      <label class="btn block">Choose backup file…<input type="file" accept=".json,application/json" hidden id="impFile"></label></div>
+    <div id="impPlan"></div>`;
+  const plan = data => {
+    const opts = (p) => `${Cloud.isGod() ? `<option value="__new">➕ New site “${esc(p.name)}”</option>` : ''}${mySites.map(s => `<option value="${esc(s.id)}" ${s.id === p.id ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}`;
+    if (!Cloud.isGod() && !mySites.length) { $('#impPlan').innerHTML = '<div class="notice warn">You need to be Admin of at least one site to import into it.</div>'; return; }
+    $('#impPlan').innerHTML = `<div class="card"><div class="lbl">Choose where each project goes</div>
+      ${data.projects.map((p, i) => { const n = data.assets.filter(a => a.projectId === p.id).length; return `<div class="field imp-row"><label><input type="checkbox" class="impChk" data-i="${i}" checked> <b>${esc(p.name)}</b> <span class="muted small">(${n} assets)</span></label><select class="impTo" data-i="${i}" aria-label="Import into">${opts(p)}</select></div>`; }).join('')}
+      <button class="btn primary block" id="impGo">Import</button><p class="muted small" id="impProg"></p></div>`;
+    $('#impGo').onclick = async () => {
+      const b = $('#impGo'); b.disabled = true; const prog = $('#impProg');
+      let na = 0, nph = 0;
+      for (const chk of view.querySelectorAll('.impChk')) {
+        if (!chk.checked) continue;
+        const p = data.projects[+chk.dataset.i]; let to = view.querySelector(`.impTo[data-i="${chk.dataset.i}"]`).value;
+        if (to === '__new') { const ex = await Data.project(p.id); to = ex ? uid() : p.id; await DB.put('projects', {...p, id: to, updatedAt: nowISO()}); }
+        const assets = data.assets.filter(a => a.projectId === p.id).map(a => ({...a, projectId: to}));
+        for (let i = 0; i < assets.length; i += 50) await DB.put('assets', ...assets.slice(i, i + 50));
+        na += assets.length;
+        const ids = new Set(assets.map(a => a.id));
+        for (const ph of data.photos.filter(x => ids.has(x.assetId))) {
+          const blob = ph.blob || (ph.data ? await dataURLToBlob(ph.data) : null); if (!blob) continue;
+          await DB.put('photos', {id: ph.id, assetId: ph.assetId, createdAt: ph.createdAt, type: ph.type || blob.type, ...(ph.inspId ? {inspId: ph.inspId, itemId: ph.itemId} : {}), blob}); nph++;
+        }
+        prog.textContent = `${na} assets, ${nph} photos queued…`;
+      }
+      const st = (data.settings || {}).inspTemplates;
+      if (st && typeof st === 'object' && Object.keys(st).length) saveTplStore({...st, ...loadTplStore()});
+      prog.textContent = `${na} assets and ${nph} photos imported – syncing…`;
+      await Cloud.sync();
+      toast(`Imported ${na} assets, ${nph} photos`, 3500); go('/');
+    };
+  };
+  const lb = $('#impLegacy'); if (lb) lb.onclick = () => plan(legacy);
+  $('#impFile').onchange = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    try { const d = JSON.parse(await f.text()); if (d.app !== 'asset-tagger') throw new Error('Not an Asset Tagger backup file'); plan(d); }
+    catch (err) { toast('Import failed: ' + err.message, 4000); }
+  };
+}
+async function bootCloud() {
+  try { await Cloud.init(); } catch (e) {
+    console.error(e); view.innerHTML = `<div class="card"><b>Couldn't start sign-in.</b><p class="muted">${esc(e.message)}</p><p class="small">Connect to the internet and reload.</p></div>`; return false;
+  }
+  const hp = new URLSearchParams(AUTH_HASH.replace(/^#/, ''));
+  if (hp.get('error_description')) { if (location.hash) history.replaceState(null, '', location.pathname + '#/'); if (!Cloud.session) { renderLogin(esc(hp.get('error_description').replace(/\+/g, ' ')) + ' – use “Forgot password” to get a new link.'); return false; } }
+  if (!Cloud.session) { renderLogin(); return false; }
+  CLOUD_ON = true;
+  await Cloud.useAccount();
+  if (AUTH_HASH) { history.replaceState(null, '', location.pathname + '#/'); }
+  const t = hp.get('type');
+  if (t === 'recovery' || t === 'invite' || t === 'signup' || Cloud.recovery) setTimeout(() => setPasswordDialog(true), 300);
+  Cloud.sync().catch(() => {});
+  return true;
+}
+
 /* ---------------- router ---------------- */
 const view = $('#view');
 const go = (h, replace) => { if (replace) location.replace('#' + h); else location.hash = h; };
@@ -1376,7 +1879,8 @@ function parseHash() {
 function setChrome(title, back, actions = '') {
   $('#title').textContent = title; document.title = title === 'Asset Tagger' ? title : `${title} – Asset Tagger`;
   const b = $('#backBtn'); b.hidden = !back; b.onclick = () => go(back);
-  $('#topActions').innerHTML = actions;
+  $('#topActions').innerHTML = actions + (CLOUD_ON && !/id="acctBtn"/.test(actions) ? accountButton() : '');
+  if (CLOUD_ON) bindAccountButton();
 }
 let bottomBar = null;
 function setBottomBar(html) {
@@ -1387,7 +1891,12 @@ async function route() {
   revokeAll(); setBottomBar(''); window.scrollTo(0, 0); view.onclick = null;
   const {parts, q} = parseHash();
   try {
+    if (!DEMO && !LOCAL && !CLOUD_ON) return renderLogin();
     if (!parts.length) return await renderHome();
+    if (parts[0] === 'users') return await renderUsers();
+    if (parts[0] === 'team') return await renderTeam();
+    if (parts[0] === 'import') return await renderImport();
+    if (parts[0] === 'settings' && parts[1] === 'checklists' && !Cloud.canEditTemplates()) return go('/settings', true);
     if (parts[0] === 'settings' && parts[1] === 'checklists') return parts[2] ? await renderChecklistEdit(parts[2]) : await renderChecklists();
     if (parts[0] === 'settings') return await renderSettings();
     if (parts[0] === 'parts') return await renderParts(null, q);
@@ -1422,7 +1931,8 @@ async function renderHome() {
   const stats = {};
   assets.forEach(a => { const s = stats[a.projectId] || (stats[a.projectId] = {n: 0, cx: 0, issue: 0}); s.n++; if (a.status === 'Commissioned') s.cx++; if (a.status === 'Issue') s.issue++; });
   view.innerHTML = `
-    <div class="row"><button class="btn primary" id="newProj">${ICON.plus} New Project</button><button class="btn" id="scanAny">${ICON.scan} Scan tag</button></div>
+    ${CLOUD_ON && Cloud.me ? `<div class="whoami small"><span>Signed in as <b>${esc(Cloud.me.full_name || Cloud.me.email)}</b> · <span class="badge">${esc(ROLE_LABEL[Cloud.role()])}</span></span>${Cloud.isGod() ? ' <a href="#/users">Users &amp; roles</a>' : ''}${Cloud.isAdmin() ? ' <a href="#/team">Team</a>' : ''}</div>` : ''}
+    <div class="row">${Cloud.canCreateSite() ? `<button class="btn primary" id="newProj">${ICON.plus} New ${CLOUD_ON ? 'Site' : 'Project'}</button>` : ''}<button class="btn" id="scanAny">${ICON.scan} Scan tag</button></div>
     ${partsReminders(projects, assets).map(reminderHtml).join('')}
     ${assets.some(a => assetParts(a).length) ? `<a class="btn block" id="allParts" href="#/parts" style="margin:4px 0 6px">🔧 Filters &amp; belts due – all projects</a>` : ''}
     ${projects.length ? `<h2>Projects</h2><div class="list">${projects.map(p => {
@@ -1432,9 +1942,9 @@ async function renderHome() {
         <div class="sub">${esc([p.client, p.address].filter(Boolean).join(' · ') || 'No details')}</div>
         <div class="sub">${s.n} asset${s.n === 1 ? '' : 's'} · ${s.cx} commissioned${s.issue ? ` · <b style="color:var(--s-issue)">${s.issue} issue${s.issue === 1 ? '' : 's'}</b>` : ''}</div>
         <div class="progress"><span style="width:${pct}%"></span></div></div><span class="chev">›</span></a>`;
-    }).join('')}</div>` : `<div class="empty"><div class="big">🏗️</div><p><b>No projects yet.</b></p><p>Create a project (job site) and start tagging AHUs, chillers, pumps, VAVs and more. Everything is saved on this device and works offline.</p></div>`}
-    <p class="muted small" style="text-align:center;margin-top:24px">Data is stored only on this device. Use <a href="#/settings">Settings → Backup</a> regularly.</p>`;
-  $('#newProj').onclick = () => projectDialog();
+    }).join('')}</div>` : `<div class="empty"><div class="big">🏗️</div><p><b>No projects yet.</b></p><p>${!CLOUD_ON ? 'Create a project (job site) and start tagging AHUs, chillers, pumps, VAVs and more. Everything is saved on this device and works offline.' : Cloud.isGod() ? 'Create a site, or <a href="#/import">import your existing data</a> from the old version.' : 'No sites are assigned to you yet. Ask your Admin to add you to a site.'}</p></div>`}
+    <p class="muted small" style="text-align:center;margin-top:24px">${CLOUD_ON ? 'Synced to your team’s cloud account. Works offline – changes sync when you have signal.' : 'Data is stored only on this device. Use <a href="#/settings">Settings → Backup</a> regularly.'}</p>`;
+  const np = $('#newProj'); if (np) np.onclick = () => projectDialog();
   $('#scanAny').onclick = $('#hdrScan').onclick = () => openScanner(null);
   $('#hdrSettings').onclick = () => go('/settings');
 }
@@ -1557,7 +2067,7 @@ async function renderProject(pid) {
   $('#bPanels').onclick = () => go(`/p/${encodeURIComponent(pid)}/panels`);
   $('#pMenu').onclick = () => {
     const m = modal({title: p.name, body: `<div class="menu">
-      <button class="btn" data-m="edit">✏️ Edit project details</button>
+      ${Cloud.canAdminSite(pid) ? '<button class="btn" data-m="edit">✏️ Edit project details</button>' : ''}
       <button class="btn" data-m="export">⬇️ Export to Excel / CSV</button>
       <button class="btn" data-m="import">⬆️ Import from Excel / CSV</button>
       <button class="btn" data-m="labels">🖨️ Print QR tag labels</button>
@@ -1565,7 +2075,7 @@ async function renderProject(pid) {
       <button class="btn" data-m="parts">🔧 Filters &amp; belts due / email list</button>
       <button class="btn" data-m="tree">🌳 System tree (what feeds what)</button>
       <button class="btn" data-m="panels">⚡ Equipment by electrical panel</button>
-      <button class="btn danger" data-m="delete">🗑️ Delete project</button></div>`});
+      ${Cloud.canAdminSite(pid) ? '<button class="btn danger" data-m="delete">🗑️ Delete project</button>' : ''}</div>`});
     m.el.addEventListener('click', async e => {
       const b = e.target.closest('[data-m]'); if (!b) return; m.close();
       const a = b.dataset.m;
@@ -1621,7 +2131,7 @@ async function renderAsset(pid, aid) {
       ${photos.map(ph => `<button class="ph" data-ph="${esc(ph.id)}"><img alt="Photo" src="${objURL(ph.blob)}"></button>`).join('')}
       <label class="addph">${ICON.camera}<span>Add photo</span><input type="file" accept="image/*" capture="environment" multiple hidden id="phInput"></label></div></div>
     <div class="row"><button class="btn" id="bLabel">${ICON.print} Print label</button><button class="btn" id="bDup">Duplicate</button></div>
-    <div class="row"><button class="btn danger" id="bDel">Delete asset</button></div>
+    ${Cloud.canAdminSite(pid) ? '<div class="row"><button class="btn danger" id="bDel">Delete asset</button></div>' : ''}
     <p class="muted small">Updated ${esc(new Date(a.updatedAt || a.createdAt).toLocaleString())}</p>`;
   setBottomBar(`<button class="btn" id="bScan">${ICON.scan} Scan next</button><button class="btn primary" id="bEdit">Edit details</button>`);
   $('#hdrEdit').onclick = $('#bEdit').onclick = () => go(base + '/edit');
@@ -1658,7 +2168,7 @@ async function renderAsset(pid, aid) {
   $('#bInspSetup').onclick = () => inspSetupDialog(pid, a);
   $('#bLabel').onclick = () => go(`/p/${encodeURIComponent(pid)}/labels?ids=${encodeURIComponent(aid)}`);
   $('#bDup').onclick = () => go(`/p/${encodeURIComponent(pid)}/a/new?from=${encodeURIComponent(aid)}`);
-  $('#bDel').onclick = async () => {
+  if ($('#bDel')) $('#bDel').onclick = async () => {
     if (await confirmBox('Delete asset?', `Delete <b>${esc(a.tag)}</b> and its ${photos.length} photo(s)?`, 'Delete', true)) {
       await Data.deleteAsset(aid); toast('Asset deleted'); go(`/p/${encodeURIComponent(pid)}`);
     }
@@ -2443,19 +2953,24 @@ async function renderSettings() {
       <p style="margin:4px 0">${projects.length} projects · ${assets.length} assets · ${assets.reduce((n, a) => n + inspList(a).length, 0)} inspections · ${photos.length} photos</p>
       <p class="muted small" style="margin:4px 0">${esc(est)}${est ? '<br>' : ''}Storage protection: <b>${persisted ? 'on (browser won\'t auto-clear)' : 'not granted yet'}</b></p>
       ${persisted ? '' : '<button class="btn sm" id="persistBtn">Request storage protection</button>'}</div>
-    <div class="card"><div class="lbl">Inspection checklists</div>
+    ${CLOUD_ON && Cloud.me ? `<div class="card"><div class="lbl">Account</div>
+      <p style="margin:4px 0">Signed in as <b>${esc(Cloud.me.full_name || Cloud.me.email)}</b> (${esc(Cloud.me.email)}) · <span class="badge">${esc(ROLE_LABEL[Cloud.role()])}</span></p>
+      <p class="small muted" style="margin:4px 0 8px">${Cloud.pending() ? `${Cloud.pending()} change(s) waiting to sync.` : 'All changes synced.'} Edits made offline are queued and sync automatically; if two people edit the same asset, the last one saved wins.</p>
+      <div class="menu">${Cloud.isGod() ? '<a class="btn block" href="#/users">👥 Users &amp; roles</a>' : ''}${Cloud.isAdmin() ? '<a class="btn block" href="#/team">🧑‍🔧 Team – assign users to my sites</a><a class="btn block" href="#/import">📥 Import my existing data (old version / backup file)</a>' : ''}
+      <button class="btn block" id="stSync">⟳ Sync now</button><button class="btn block danger" id="stOut">Sign out</button></div></div>` : ''}
+    ${Cloud.canEditTemplates() ? `<div class="card"><div class="lbl">Inspection checklists</div>
       <p class="small" style="margin:4px 0 10px">Task lists per equipment type (AHU, chiller, pump…): add, remove or reorder items, mark required / optional, ask for readings, and set the default interval.</p>
-      <a class="btn block" id="setChk" href="#/settings/checklists">✅ Edit inspection checklists</a></div>
+      <a class="btn block" id="setChk" href="#/settings/checklists">✅ Edit inspection checklists</a></div>` : ''}
     <div class="card"><div class="lbl">Backup (includes photos)</div>
       <p class="small">Saves everything to one <b>.json</b> file you can keep in email / Drive / OneDrive and restore on any device. Do this at the end of each site visit.</p>
       <div class="row">${canShareFiles() ? '<button class="btn" id="bkShare">Share backup…</button>' : ''}<button class="btn primary" id="bkDl">Download backup</button></div>
-      <div class="sep"></div>
+      ${CLOUD_ON ? '' : `<div class="sep"></div>
       <div class="lbl">Restore</div><p class="small">Merges a backup file into this device (records with the same ID are replaced).</p>
-      <label class="btn block">Restore from backup file…<input type="file" accept=".json,application/json" hidden id="bkFile"></label></div>
+      <label class="btn block">Restore from backup file…<input type="file" accept=".json,application/json" hidden id="bkFile"></label>`}</div>
     <div class="card"><div class="lbl">Install on your phone</div>
       ${standalone ? '<p>✅ Running as an installed app.</p>' : `<p class="small"><b>iPhone (Safari):</b> Share button → <i>Add to Home Screen</i>.<br><b>Android (Chrome):</b> ⋮ menu → <i>Install app</i> / <i>Add to Home screen</i>.</p>`}
       <p class="small muted">Once installed it opens full-screen and works with no signal. Live camera scanning requires the app to be served over https.</p></div>
-    <div class="card"><div class="lbl">Danger zone</div><button class="btn danger block" id="wipe">Delete ALL data on this device</button></div>
+    ${CLOUD_ON ? '' : '<div class="card"><div class="lbl">Danger zone</div><button class="btn danger block" id="wipe">Delete ALL data on this device</button></div>'}
     <p class="muted small" style="text-align:center">Asset Tagger v${APP_VERSION}</p>`;
   const pb = $('#persistBtn'); if (pb) pb.onclick = async () => { const ok = navigator.storage && navigator.storage.persist ? await navigator.storage.persist() : false; toast(ok ? 'Storage protection on' : 'Browser declined — install to home screen and try again'); route(); };
   const doBackup = async share => {
@@ -2467,7 +2982,8 @@ async function renderSettings() {
   };
   $('#bkDl').onclick = () => doBackup(false);
   const bs = $('#bkShare'); if (bs) bs.onclick = () => doBackup(true);
-  $('#bkFile').onchange = async e => {
+  if (CLOUD_ON) { $('#stSync').onclick = async () => { await Cloud.sync(); toast(Cloud.lastError ? 'Sync failed: ' + Cloud.lastError : 'Synced'); route(); }; $('#stOut').onclick = () => Cloud.signOut(); }
+  if ($('#bkFile')) $('#bkFile').onchange = async e => {
     const f = e.target.files[0]; if (!f) return;
     try {
       const data = JSON.parse(await f.text());
@@ -2482,7 +2998,7 @@ async function renderSettings() {
       toast('Backup restored'); route();
     } catch (err) { toast('Restore failed: ' + err.message, 4000); }
   };
-  $('#wipe').onclick = async () => {
+  if ($('#wipe')) $('#wipe').onclick = async () => {
     if (await confirmBox('Delete everything?', 'All projects, assets and photos on this device will be permanently deleted. Make a backup first!', 'Delete all', true)) { await DB.clear(); toast('All data deleted'); go('/'); }
   };
 }
@@ -2624,11 +3140,12 @@ window.AssetTagger = {Data, DB, buildExport, planImport, parseImportFile, handle
   splitTags, fedList, normPanel, relIndex, upstreamPath, renameRefs, powerLine, typeSummary, applyFilter, FIELDS,
   addMonths, normPart, partNextDue, partStatus, partHits, collectParts, partTotals, partsContext, partsEmail, parseEmails, parseFreq, applyPartsImport, buildPartsXlsx, version: APP_VERSION,
   getTemplate, defaultTemplate, newInspection, inspCounts, inspResult, inspNextDue, inspDueStatus, inspFreqOf, inspBuckets, inspRows, inspText, INSP_DEFAULTS,
-  demo: DEMO, dbName: DB_NAME, seedDemo: () => seedDemo(), resetDemo: () => resetDemo()};
+  demo: DEMO, get dbName() { return DB_NAME; }, Cloud, seedDemo: () => seedDemo(), resetDemo: () => resetDemo()};
 if ('serviceWorker' in navigator && window.isSecureContext && location.protocol !== 'file:') {
   window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js', {scope: './'}).catch(e => console.warn('SW registration failed', e)));
 }
 if (!DEMO && navigator.storage && navigator.storage.persist) navigator.storage.persisted().then(p => { if (!p) navigator.storage.persist().catch(() => {}); }).catch(() => {});
 if (DEMO) { demoBanner(); ensureDemo().catch(e => console.error('Demo data failed', e)).then(route); }
-else route();
+else if (LOCAL) route();
+else bootCloud().then(ok => { if (ok) route(); });
 })();

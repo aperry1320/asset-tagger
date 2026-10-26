@@ -1,4 +1,4 @@
-# Asset Tagger (v1.5.0)
+# Asset Tagger (v2.0.0)
 
 **Showcase page:** https://aperry1320.github.io/asset-tagger/demo/ ·
 **Live demo with sample data:** https://aperry1320.github.io/asset-tagger/?demo=1
@@ -6,7 +6,37 @@
 Offline-first, mobile-first web app for tagging HVAC / mechanical equipment on job sites
 (AHUs, RTUs, chillers, boilers, pumps, VAVs, FCUs, exhaust fans, cooling towers, heat exchangers, VRF units…).
 
-Plain static files. No build step, no server code, no account. All data stays in the phone's browser (IndexedDB).
+Plain static files, no build step. Since v2.0, sign-in, roles and team sync use Supabase (see below); data is cached in the phone's browser (IndexedDB) so it works offline.
+
+## Accounts, roles & team sync (v2.0.0)
+
+Backend: **Supabase** project `asset-tagger` (ref `xqbptmdhppabqdoyhpdh`, region us-east-1, Free plan).
+The browser only contains the *publishable* key (public by design – Row Level Security protects the data). The service-role key lives only inside the Supabase Edge Function and is never in this repo or the app.
+
+| Role | Can do |
+|---|---|
+| **God** (setup) | Everything: create/delete sites, invite people, set roles, assign Admins and Users to any site, import data, edit checklist templates. |
+| **Admin** (site manager) | Full edit of the sites they're assigned to as Admin (incl. deleting assets / the site), add/remove Users on those sites, invite new Users, import data into their sites, edit checklist templates. Can't see other sites, create sites, or change roles. |
+| **User** | See and edit assets, filters & belts, photos and inspections on assigned sites only. No site deletion, no asset deletion, no people management. |
+
+* **Sign in**: email + password (supabase-js vendored at `vendor/supabase.js`, cached offline). *Forgot password* emails a reset link. There is no sign-up button; any account that somehow self-registers gets role User with **no sites** = sees nothing.
+* **Inviting**: God → *Users & roles*, Admin → *Team*. Enter email (+ optional name, role, site). Leave the password blank to send an invite email (they choose a password), or type a temporary password to create the account without email. Implemented by the Edge Function `manage-users` (`supabase/functions/manage-users`), which checks the caller's role server-side.
+* **Sync**: IndexedDB is still the working copy (per signed-in account), so everything works with no signal. Each local change goes into an outbox and is pushed when online (on change, on reconnect, every 2 min, when the app comes to the foreground), then everything the account can see is pulled. **Conflicts: last write wins per record** (a whole asset including its parts and inspections). Changes rejected by the server (no permission) are dropped and the server copy is restored. The top-right avatar shows sync status (✓ synced · ↑n pending · ⏸ offline · ! problem).
+* **Photos** go to the private Storage bucket `photos` at `<site>/<asset>/<photo>`; access follows the site assignment.
+* **Import my existing data** (God/Admin, Settings or account menu): pick a v1 backup `.json`, or on the same phone/browser use the old version's data directly; choose the target site per project (God can also create a new site). IDs are kept, so re-importing the same backup doesn't duplicate.
+* **Old single-device mode**: the pre-v2 local data is never touched or deleted. `?local=1` opens the old no-account mode on that data (used by the regression tests).
+* **Demo** (`?demo=1`) stays 100% local: no login, sample data, nothing uploaded.
+* Sign out clears this device's cached copy (warns if changes haven't synced yet).
+
+### Database (see `supabase/migrations/`)
+`profiles` (id → auth.users, email, full_name, role god|admin|user) · `sites` (= projects; `data` jsonb holds the app's project object) · `site_admins`, `site_members` (assignments) · `assets` (`site_id`, tag, type, `data` jsonb = the full app asset incl. `parts[]`, `inspections[]`) · `parts`, `inspections`, `inspection_items` (query/report copies kept in sync by trigger from `assets.data`; read-only for clients) · `checklist_templates` (type → template) · `photos` (metadata; files in Storage). RLS is on for every table, using `private.*` security-definer helpers (`is_god`, `can_admin_site`, `can_access_site`) in a schema that is not exposed through the API. A trigger stops anyone but God from changing roles.
+
+### Limitations (v2.0)
+* Last-write-wins, no field-level merge or edit history.
+* Every sync pulls all visible records (fine for hundreds/low thousands of assets; would need incremental sync for much more).
+* Supabase Free plan: built-in email is rate-limited (a few emails per hour) – use temporary passwords when adding many people at once, or add your own SMTP in the dashboard. Free projects pause after ~1 week with no activity (restore from the dashboard).
+* Admins can see the list of all non-God accounts (name/email) so they can add existing people to their sites.
+* Checklist templates are shared by everyone (one set for the whole company).
 
 ## Demo mode & showcase (v1.4.0)
 - `/demo/` is a static showcase / landing page (no JavaScript). The app's service worker deliberately passes `/demo/` requests to the network,
@@ -105,11 +135,10 @@ Any static host works. Upload the folder contents as-is.
    (password-protected and deleted after 1 hour unless claimed), so sign in or claim it to keep it.
 
 ## Data notes / limitations
-- "Email this list" uses a `mailto:` link (there is no server), so the app can't send email by itself or attach files:
+- "Email this list" uses a `mailto:` link, so the app can't send email by itself or attach files:
   it opens your mail app ready to send. Very long lists are shortened in the email (totals first) – attach the Excel instead.
-- Data lives only in that phone's browser. Clearing site data, uninstalling, or (on iPhone) not using a non-installed
-  site for weeks can erase it. Install the app to the home screen, allow "storage protection", and **back up regularly**.
-- There's no multi-user sync between devices yet. Use backup/restore or export/import to move data.
+- Signed in (v2), data is in Supabase and cached on the phone; only changes that haven't synced yet are at risk if the browser's storage is cleared.
+  In `?local=1` mode data lives only in that browser – back up regularly.
 - Relationships are stored by tag within a project. Deleting an asset leaves other units pointing at its tag (shown as "not tagged yet");
   tags renamed by a spreadsheet import (rather than in the app) are not re-pointed. The panel view is a planning aid: always verify in the field before LOTO.
 - Spreadsheet exports don't include photos (they show a photo count). The JSON backup does include them.
